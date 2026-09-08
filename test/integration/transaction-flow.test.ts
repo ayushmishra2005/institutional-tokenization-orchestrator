@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import {
   approveTwice,
@@ -18,9 +18,8 @@ import { transactionAttempts } from '../../src/db/schema/index.js';
 import { listAttemptsForOperation } from '../../src/db/repositories/transaction-repository.js';
 
 /**
- * Transport-fault behaviour of the transaction lane. Broadcast is intercepted so the
- * ambiguous-acknowledgement paths can be exercised deterministically, while every
- * assertion is still made against real Anvil state.
+ * Broadcast is intercepted so the ambiguous-acknowledgement paths run deterministically,
+ * while every assertion is still made against real Anvil state.
  */
 describe('transaction flow under transport faults', () => {
   let harness: TestHarness;
@@ -79,6 +78,9 @@ describe('transaction flow under transport faults', () => {
     );
     expect(balance).toBe(BigInt(amount));
     expect(distinctMintBytes(gateway, mintBroadcasts)).toBe(1);
+
+    const broadcastUnknown = await harness.container.metrics.broadcastUnknownTotal.get();
+    expect(broadcastUnknown.values[0]?.value).toBeGreaterThanOrEqual(1);
   });
 
   it('rebroadcasts the identical signed bytes when nothing reached the chain', async () => {
@@ -152,21 +154,11 @@ describe('transaction flow under transport faults', () => {
   });
 
   it('records REVERTED, not FAILED, when a mint reverts on chain', async () => {
-    // The contract is given a short eligibility window while the durable compliance
-    // decision keeps its full validity. Once the window lapses the application still
-    // believes the recipient is eligible, but the chain - the actual authority - refuses.
-    gateway.controls.eligibilityWindowSeconds = 5;
     const seed = await seedAssetAndWallet(harness);
-    delete gateway.controls.eligibilityWindowSeconds;
 
-    const eligibleUntil = await harness.container.gateway.readEligibleUntil(
-      seed.contractAddress,
-      seed.recipient,
-    );
-    expect(eligibleUntil).toBeGreaterThan(0n);
-    await waitUntilAfter(eligibleUntil);
-
-    // Simulation would catch this, so it is bypassed to reach a real on-chain revert.
+    // The mint is encoded with an already-expired deadline, which the contract rejects.
+    // Simulation would catch it, so it is bypassed to reach a real on-chain revert.
+    gateway.controls.expireMintDeadline = true;
     gateway.controls.forceSimulationSuccess = true;
 
     const mint = await requestMint(harness, seed, '1000000000000000000');
@@ -228,20 +220,37 @@ describe('transaction flow under transport faults', () => {
     expect(state).toBe(OperationState.FAILED);
     compliance.clearForcedIneligible(seed.recipient);
 
-    // No signing or broadcast happened at all.
     const attempts = await listAttemptsForOperation(harness.container.db, mint.operationId);
     expect(attempts.filter((attempt) => attempt.signedRawTransaction !== null)).toHaveLength(0);
+  });
+
+  it('fails without broadcasting when the signer rejects the transaction', async () => {
+    const seed = await seedAssetAndWallet(harness);
+    const mint = await requestMint(harness, seed, '1000000000000000000');
+
+    const broadcastsBefore = gateway.broadcasts.length;
+    const signer = vi
+      .spyOn(harness.container.signer, 'sign')
+      .mockResolvedValue({ kind: 'REJECTED', reason: 'signer unavailable', code: 'SIGNER_DOWN' });
+
+    await approveTwice(harness, mint.approvalRequestId);
+    const state = await waitForState(
+      harness,
+      mint.operationId,
+      (value) => value === OperationState.FAILED || value === OperationState.SUCCEEDED,
+      60_000,
+    );
+    signer.mockRestore();
+
+    expect(state).toBe(OperationState.FAILED);
+    expect(gateway.broadcasts).toHaveLength(broadcastsBefore);
+
+    const attempts = await listAttemptsForOperation(harness.container.db, mint.operationId);
+    expect(attempts.every((attempt) => attempt.signedRawTransaction === null)).toBe(true);
   });
 });
 
 /** Number of distinct payloads broadcast after `from`, i.e. by the mint under test. */
 function distinctMintBytes(gateway: FaultInjectingGateway, from: number): number {
   return new Set(gateway.broadcasts.slice(from).map((call) => call.signed)).size;
-}
-
-/** Sleeps until the wall clock is safely past an on-chain unix deadline. */
-async function waitUntilAfter(unixSeconds: bigint): Promise<void> {
-  const targetMs = Number(unixSeconds) * 1000 + 2000;
-  const remaining = targetMs - Date.now();
-  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
 }

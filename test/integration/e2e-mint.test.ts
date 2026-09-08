@@ -56,11 +56,23 @@ describe('end-to-end mint', () => {
     ).json<{
       state: string;
       operationReference: string;
+      history: { state: string; at: string }[];
       transactionAttempts: { status: string; transactionHash: string | null; nonce: number }[];
       reconciliation: { kind: string; matched: boolean }[];
     }>();
 
-    // Every reconciliation check must have matched.
+    expect(operation.history.map((entry) => entry.state)).toEqual([
+      OperationState.PENDING_APPROVAL,
+      OperationState.READY,
+      OperationState.PREPARING,
+      OperationState.SIGNING,
+      OperationState.SIGNED,
+      OperationState.BROADCASTING,
+      OperationState.SUBMITTED,
+      OperationState.INCLUDED,
+      OperationState.SUCCEEDED,
+    ]);
+
     expect(operation.reconciliation.length).toBeGreaterThanOrEqual(5);
     expect(operation.reconciliation.every((entry) => entry.matched)).toBe(true);
     expect(operation.reconciliation.map((entry) => entry.kind)).toEqual(
@@ -123,7 +135,6 @@ describe('end-to-end mint', () => {
         'operation.succeeded',
       ]),
     );
-    // Two approvals produce two decision records.
     expect(actions.filter((action) => action === 'approval.decision_recorded')).toHaveLength(2);
     expect(events.every((event) => event.correlationId.length > 0)).toBe(true);
   });
@@ -146,17 +157,14 @@ describe('end-to-end mint', () => {
     expect(denied.json<{ error: { code: string } }>().error.code).toBe('FORBIDDEN');
   });
 
-  it('reports health and metrics', async () => {
+  it('scopes API readiness to PostgreSQL, the only dependency it needs synchronously', async () => {
     const live = await harness.app.inject({ method: 'GET', url: '/health/live' });
     expect(live.statusCode).toBe(200);
 
     const ready = await harness.app.inject({ method: 'GET', url: '/health/ready' });
     expect(ready.statusCode).toBe(200);
-    expect(ready.json<{ checks: Record<string, string> }>().checks).toMatchObject({
-      postgres: 'ok',
-      redis: 'ok',
-      evm: 'ok',
-    });
+    const { checks } = ready.json<{ checks: Record<string, string> }>();
+    expect(checks).toEqual({ postgres: 'ok' });
 
     const metrics = await harness.app.inject({ method: 'GET', url: '/metrics' });
     expect(metrics.statusCode).toBe(200);

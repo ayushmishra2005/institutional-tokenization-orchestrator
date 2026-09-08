@@ -1,12 +1,10 @@
 /**
- * Drizzle mirror of src/db/migrations/*.sql.
- *
- * The SQL migrations are authoritative: constraints, partial indexes and triggers live
- * there. This file exists to give the repositories typed access, so it must be kept in
- * step with the migrations by hand.
+ * Drizzle mirror of src/db/migrations/*.sql, kept in step by hand. The migrations are
+ * authoritative: constraints, partial indexes and triggers live there, not here.
  */
 import {
   bigint,
+  bigserial,
   boolean,
   index,
   integer,
@@ -120,11 +118,10 @@ export const operations = pgTable(
     assetId: uuid('asset_id')
       .notNull()
       .references(() => assets.id),
-    walletId: uuid('wallet_id')
-      .notNull()
-      .references(() => wallets.id),
-    amount: numeric('amount').notNull(),
-    operationReference: text('operation_reference').notNull().unique(),
+    walletId: uuid('wallet_id').references(() => wallets.id),
+    amount: numeric('amount'),
+    operationReference: text('operation_reference').unique(),
+    complianceDecisionId: uuid('compliance_decision_id').references(() => complianceDecisions.id),
     proposalHash: text('proposal_hash').notNull(),
     requiredApprovals: smallint('required_approvals').notNull(),
     requestedBy: uuid('requested_by')
@@ -140,6 +137,20 @@ export const operations = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index('operations_state_idx').on(table.state, table.stateUpdatedAt)],
+);
+
+export const operationTransitions = pgTable(
+  'operation_transitions',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    operationId: uuid('operation_id')
+      .notNull()
+      .references(() => operations.id),
+    fromState: text('from_state'),
+    toState: text('to_state').notNull(),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('operation_transitions_operation_idx').on(table.operationId, table.id)],
 );
 
 export const approvalRequests = pgTable('approval_requests', {
@@ -305,8 +316,11 @@ export const chainObservations = pgTable('chain_observations', {
   blockNumber: bigint('block_number', { mode: 'number' }),
   transactionHash: text('transaction_hash'),
   matched: boolean('matched').notNull(),
+  severity: text('severity').notNull().default('INFO'),
+  status: text('status').notNull().default('OPEN'),
   expected: jsonb('expected'),
   actual: jsonb('actual'),
   detail: text('detail'),
   observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+  resolvedAt: timestamp('resolved_at', { withTimezone: true }),
 });

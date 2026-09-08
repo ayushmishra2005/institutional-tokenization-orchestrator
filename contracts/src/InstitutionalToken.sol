@@ -72,8 +72,6 @@ contract InstitutionalToken is ERC20Pausable, AccessControl {
         return _decimals;
     }
 
-    // --- compliance -------------------------------------------------------
-
     /// @param eligibleUntilTimestamp Unix seconds; 0 revokes eligibility immediately.
     function setEligibility(address account, uint64 eligibleUntilTimestamp)
         external
@@ -89,8 +87,6 @@ contract InstitutionalToken is ERC20Pausable, AccessControl {
         return until != 0 && until >= block.timestamp;
     }
 
-    // --- pause ------------------------------------------------------------
-
     function pause() external onlyRole(PAUSER_ROLE) {
         _pause();
     }
@@ -98,8 +94,6 @@ contract InstitutionalToken is ERC20Pausable, AccessControl {
     function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
     }
-
-    // --- minting ----------------------------------------------------------
 
     /// @notice Mint `amount` to `recipient`, exactly once per `operationReference`.
     /// @dev The reference binds an off-chain approved operation to a single on-chain effect,
@@ -134,8 +128,6 @@ contract InstitutionalToken is ERC20Pausable, AccessControl {
 
         emit MintExecuted(operationReference, recipient, amount, totalSupply());
     }
-
-    // --- transfer restrictions -------------------------------------------
 
     /// @dev Eligibility is enforced for every inbound movement, not only minting, so the
     ///      chain remains the authority on who may hold the asset.

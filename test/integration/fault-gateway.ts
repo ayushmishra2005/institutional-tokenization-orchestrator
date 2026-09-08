@@ -38,17 +38,18 @@ export interface FaultGatewayControls {
   /** Invoked immediately before the broadcast decision is applied. */
   beforeBroadcast?: () => Promise<void>;
   /**
-   * Shortens the on-chain eligibility window written by compliance sync, without
-   * touching the durable decision. Lets a test reach a state where the application
-   * believes the recipient is eligible but the contract disagrees.
+   * Encodes the mint with a deadline already in the past, so the contract reverts with
+   * MintDeadlineExpired. Combined with forceSimulationSuccess this reaches a real
+   * on-chain revert rather than a pre-flight rejection.
    */
-  eligibilityWindowSeconds?: number;
+  expireMintDeadline: boolean;
+  /** Number of receipt lookups to fail with a transport error before passing through. */
+  failReceiptLookups: number;
 }
 
 /**
- * Delegating EvmGateway that injects transport-level faults. Only broadcast and
- * simulation are altered; everything else hits the real Anvil node so the assertions
- * are still made against canonical chain state.
+ * Delegating EvmGateway that injects transport faults. Only broadcast and simulation are
+ * altered; everything else hits the real node, so assertions still check canonical state.
  */
 export class FaultInjectingGateway implements EvmGateway {
   readonly broadcasts: BroadcastCall[] = [];
@@ -56,6 +57,8 @@ export class FaultInjectingGateway implements EvmGateway {
   readonly controls: FaultGatewayControls = {
     broadcastPlan: [],
     forceSimulationSuccess: false,
+    expireMintDeadline: false,
+    failReceiptLookups: 0,
   };
 
   constructor(private readonly inner: EvmGateway) {}
@@ -64,8 +67,9 @@ export class FaultInjectingGateway implements EvmGateway {
     this.broadcasts.length = 0;
     this.controls.broadcastPlan = [];
     this.controls.forceSimulationSuccess = false;
+    this.controls.expireMintDeadline = false;
+    this.controls.failReceiptLookups = 0;
     delete this.controls.beforeBroadcast;
-    delete this.controls.eligibilityWindowSeconds;
   }
 
   async broadcastRawTransaction(signed: `0x${string}`): Promise<`0x${string}`> {
@@ -130,19 +134,22 @@ export class FaultInjectingGateway implements EvmGateway {
   }
 
   encodeMintCall(contract: `0x${string}`, params: MintCallParams): EncodedCall {
-    return this.inner.encodeMintCall(contract, params);
-  }
-
-  encodeSetEligibilityCall(contract: `0x${string}`, params: SetEligibilityParams): EncodedCall {
-    const window = this.controls.eligibilityWindowSeconds;
-    if (window === undefined) return this.inner.encodeSetEligibilityCall(contract, params);
-    return this.inner.encodeSetEligibilityCall(contract, {
+    if (!this.controls.expireMintDeadline) return this.inner.encodeMintCall(contract, params);
+    return this.inner.encodeMintCall(contract, {
       ...params,
-      eligibleUntil: BigInt(Math.floor(Date.now() / 1000) + window),
+      deadline: BigInt(Math.floor(Date.now() / 1000) - 60),
     });
   }
 
+  encodeSetEligibilityCall(contract: `0x${string}`, params: SetEligibilityParams): EncodedCall {
+    return this.inner.encodeSetEligibilityCall(contract, params);
+  }
+
   getTransactionReceipt(hash: `0x${string}`): Promise<TransactionReceiptView | null> {
+    if (this.controls.failReceiptLookups > 0) {
+      this.controls.failReceiptLookups -= 1;
+      return Promise.reject(new Error('injected RPC timeout on receipt lookup'));
+    }
     return this.inner.getTransactionReceipt(hash);
   }
 

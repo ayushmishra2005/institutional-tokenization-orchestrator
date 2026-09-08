@@ -13,8 +13,12 @@ export class Metrics {
   readonly operationTransitions: Counter<'from' | 'to' | 'type'>;
   readonly operationsInState: Gauge<'state'>;
   readonly operationsFailed: Counter<'reason'>;
+  readonly operationDuration: Histogram<'type' | 'outcome'>;
   readonly broadcastUnknownTotal: Counter<string>;
   readonly transactionConfirmations: Counter<'outcome'>;
+  readonly reconciliationFindings: Counter<'type' | 'outcome'>;
+  readonly openReconciliationFindings: Gauge<'severity'>;
+  readonly signerFailures: Counter<'reason'>;
 
   readonly outboxBacklog: Gauge<'status'>;
   readonly outboxDispatched: Counter<'topic' | 'result'>;
@@ -65,6 +69,14 @@ export class Metrics {
       registers: [this.registry],
     });
 
+    this.operationDuration = new Histogram({
+      name: 'ito_operation_duration_seconds',
+      help: 'Time from operation creation to a terminal state',
+      labelNames: ['type', 'outcome'] as const,
+      buckets: [0.5, 1, 2.5, 5, 10, 30, 60, 120, 300],
+      registers: [this.registry],
+    });
+
     this.broadcastUnknownTotal = new Counter({
       name: 'ito_broadcast_unknown_total',
       help: 'Broadcast attempts whose outcome could not be determined',
@@ -75,6 +87,27 @@ export class Metrics {
       name: 'ito_transaction_confirmations_total',
       help: 'Confirmed transactions by receipt outcome',
       labelNames: ['outcome'] as const,
+      registers: [this.registry],
+    });
+
+    this.reconciliationFindings = new Counter({
+      name: 'ito_reconciliation_checks_total',
+      help: 'Reconciliation runs by operation type and whether the evidence was coherent',
+      labelNames: ['type', 'outcome'] as const,
+      registers: [this.registry],
+    });
+
+    this.openReconciliationFindings = new Gauge({
+      name: 'ito_reconciliation_open_findings',
+      help: 'Unresolved reconciliation findings by severity',
+      labelNames: ['severity'] as const,
+      registers: [this.registry],
+    });
+
+    this.signerFailures = new Counter({
+      name: 'ito_signer_failures_total',
+      help: 'Signing requests that were rejected or failed verification',
+      labelNames: ['reason'] as const,
       registers: [this.registry],
     });
 

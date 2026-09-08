@@ -7,7 +7,10 @@ import { DevJwtAuthenticator } from '../platform/auth/jwt.js';
 import { findUserBySubject, toActor } from '../db/repositories/user-repository.js';
 import { UnauthorizedError, AppError, ErrorCode, NotFoundError } from '../domain/errors.js';
 import type { RequestContext } from '../modules/context.js';
+import { listOperationHistory } from '../db/repositories/operation-repository.js';
 import { listAttemptsForOperation, listObservations } from '../db/repositories/transaction-repository.js';
+import type { AssetRecord } from '../db/repositories/asset-repository.js';
+import type { WalletRecord } from '../db/repositories/wallet-repository.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -61,11 +64,8 @@ const auditQuerySchema = z.object({
 });
 
 /**
- * HTTP transport.
- *
- * Handlers only parse input, call one application service and shape the response. All
- * authorization, state and persistence decisions live in the services, so the same rules
- * apply to the worker and the demo script.
+ * Handlers parse input, call one application service and shape the response. Authorization,
+ * state and persistence decisions belong to the services so the worker obeys the same rules.
  */
 export async function buildApp(container: Container): Promise<FastifyInstance> {
   const app = Fastify({
@@ -137,27 +137,19 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
     });
   });
 
-  // --- health & metrics --------------------------------------------------
-
+  // Liveness only answers whether this process is still serving; it must never depend on
+  // a dependency, or a brief PostgreSQL blip would get the API killed instead of drained.
   app.get('/health/live', async () => ({ status: 'ok' }));
 
+  // The API's synchronous work is reading and writing PostgreSQL. It records intent and
+  // returns; the chain and the queue are the worker's problem, so a degraded RPC endpoint
+  // must not take the API out of the load balancer.
   app.get('/health/ready', async (_request, reply) => {
-    const checks: Record<string, 'ok' | 'error'> = {};
-    await container.db
-      .execute('SELECT 1')
-      .then(() => (checks['postgres'] = 'ok'))
-      .catch(() => (checks['postgres'] = 'error'));
-    await container.redis
-      .ping()
-      .then(() => (checks['redis'] = 'ok'))
-      .catch(() => (checks['redis'] = 'error'));
-    await container.gateway
-      .getChainIdentity()
-      .then(() => (checks['evm'] = 'ok'))
-      .catch(() => (checks['evm'] = 'error'));
-
-    const ready = Object.values(checks).every((value) => value === 'ok');
-    return reply.status(ready ? 200 : 503).send({ status: ready ? 'ready' : 'degraded', checks });
+    const postgres = await checkReadiness(() => container.db.execute('SELECT 1'));
+    const ready = postgres === 'ok';
+    return reply
+      .status(ready ? 200 : 503)
+      .send({ status: ready ? 'ready' : 'degraded', checks: { postgres } });
   });
 
   app.get('/metrics', async (_request, reply) => {
@@ -167,20 +159,26 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
       .send(await container.metrics.render());
   });
 
-  // --- assets ------------------------------------------------------------
-
+  // Deployment is a chain write, so the response is an accepted intent plus the operation
+  // to poll. The asset is not usable until that operation reaches SUCCEEDED.
   app.post('/v1/assets', { onRequest: authenticate }, async (request, reply) => {
     const body = createAssetSchema.parse(request.body);
-    const asset = await container.assets.createAsset(request.ctx, body);
-    return reply.status(201).send(serializeAsset(asset));
+    const created = await container.assets.createAsset(request.ctx, body);
+    return reply
+      .status(202)
+      .send({ ...serializeAsset(created.asset), provisioningOperationId: created.operationId });
+  });
+
+  app.post('/v1/assets/:assetId/deployments', { onRequest: authenticate }, async (request, reply) => {
+    const { assetId } = z.object({ assetId: z.string().uuid() }).parse(request.params);
+    const operation = await container.assets.requestDeployment(request.ctx, assetId);
+    return reply.status(202).send({ operationId: operation.id, state: operation.state });
   });
 
   app.get('/v1/assets/:assetId', { onRequest: authenticate }, async (request) => {
     const { assetId } = z.object({ assetId: z.string().uuid() }).parse(request.params);
     return serializeAsset(await container.assets.getAsset(request.ctx, assetId));
   });
-
-  // --- wallets -----------------------------------------------------------
 
   app.post('/v1/wallets', { onRequest: authenticate }, async (request, reply) => {
     const body = createWalletSchema.parse(request.body);
@@ -194,11 +192,13 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
     async (request, reply) => {
       const { walletId } = z.object({ walletId: z.string().uuid() }).parse(request.params);
       const body = complianceDecisionSchema.parse(request.body ?? {});
-      const decision = await container.compliance.recordDecision(request.ctx, {
+      const { decision, operationId } = await container.compliance.recordDecision(request.ctx, {
         walletId,
         ...body,
       });
-      return reply.status(201).send({
+      // 202 whenever an on-chain eligibility write was queued; the decision itself is
+      // already durable, but the chain does not reflect it yet.
+      return reply.status(operationId === null ? 201 : 202).send({
         id: decision.id,
         walletId: decision.walletId,
         assetId: decision.assetId,
@@ -209,11 +209,10 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
         validUntil: decision.validUntil.toISOString(),
         decidedAt: decision.decidedAt.toISOString(),
         chainSyncStatus: decision.chainSyncStatus,
+        eligibilityOperationId: operationId,
       });
     },
   );
-
-  // --- mints -------------------------------------------------------------
 
   app.post('/v1/assets/:assetId/mints', { onRequest: authenticate }, async (request, reply) => {
     const { assetId } = z.object({ assetId: z.string().uuid() }).parse(request.params);
@@ -244,8 +243,6 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
       });
   });
 
-  // --- approvals ---------------------------------------------------------
-
   app.post(
     '/v1/approval-requests/:requestId/decisions',
     { onRequest: authenticate },
@@ -260,8 +257,6 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
     },
   );
 
-  // --- operations --------------------------------------------------------
-
   app.get('/v1/operations/:operationId', { onRequest: authenticate }, async (request) => {
     const { operationId } = z.object({ operationId: z.string().uuid() }).parse(request.params);
     const operation = await container.mints.getOperation(request.ctx, operationId);
@@ -269,6 +264,7 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
 
     const attempts = await listAttemptsForOperation(container.db, operation.id);
     const observations = await listObservations(container.db, operation.id);
+    const history = await listOperationHistory(container.db, operation.id);
 
     return {
       id: operation.id,
@@ -284,6 +280,9 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
       correlationId: operation.correlationId,
       createdAt: operation.createdAt.toISOString(),
       stateUpdatedAt: operation.stateUpdatedAt.toISOString(),
+      transactionHash: attempts.find((attempt) => attempt.transactionHash !== null)
+        ?.transactionHash ?? null,
+      history: history.map((entry) => ({ state: entry.state, at: entry.at.toISOString() })),
       // Signed transaction bytes are deliberately never exposed through the API.
       transactionAttempts: attempts.map((attempt) => ({
         id: attempt.id,
@@ -299,14 +298,15 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
       reconciliation: observations.map((observation) => ({
         kind: observation.kind,
         matched: observation.matched,
+        severity: observation.severity,
+        status: observation.status,
         expected: observation.expected,
         actual: observation.actual,
+        detail: observation.detail,
         observedAt: observation.observedAt.toISOString(),
       })),
     };
   });
-
-  // --- audit -------------------------------------------------------------
 
   app.get('/v1/audit-events', { onRequest: authenticate }, async (request) => {
     const query = auditQuerySchema.parse(request.query);
@@ -331,19 +331,13 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
   return app;
 }
 
-function serializeAsset(asset: {
-  id: string;
-  symbol: string;
-  name: string;
-  decimals: number;
-  supplyCap: string;
-  chainId: number;
-  contractAddress: string | null;
-  deploymentTxHash: string | null;
-  status: string;
-  policyVersion: number;
-  createdAt: Date;
-}) {
+async function checkReadiness(probe: () => Promise<unknown>): Promise<'ok' | 'error'> {
+  return probe()
+    .then(() => 'ok' as const)
+    .catch(() => 'error' as const);
+}
+
+function serializeAsset(asset: AssetRecord) {
   return {
     id: asset.id,
     symbol: asset.symbol,
@@ -359,15 +353,7 @@ function serializeAsset(asset: {
   };
 }
 
-function serializeWallet(wallet: {
-  id: string;
-  address: string;
-  chainId: number;
-  label: string | null;
-  investorReference: string;
-  status: string;
-  createdAt: Date;
-}) {
+function serializeWallet(wallet: WalletRecord) {
   return {
     id: wallet.id,
     address: wallet.address,

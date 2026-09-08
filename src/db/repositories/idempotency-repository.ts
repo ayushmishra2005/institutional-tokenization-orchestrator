@@ -34,11 +34,9 @@ export interface IdempotencyIdentity {
 }
 
 /**
- * Attempts to claim a key.
- *
- * Returns `{ claimed: true }` for the single winner of a concurrent race, and the
- * existing row for everybody else. The uniqueness of (scope, org, actor, key) in
- * PostgreSQL is what makes this safe - there is no Redis lock involved.
+ * Returns `{ claimed: true }` for the single winner of a concurrent race and the existing
+ * row for everybody else. The UNIQUE (scope, org, actor, key) index is what serialises
+ * this; there is no Redis lock involved.
  */
 export async function claimIdempotencyKey(
   executor: Executor,

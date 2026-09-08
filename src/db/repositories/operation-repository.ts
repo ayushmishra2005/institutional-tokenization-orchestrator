@@ -1,6 +1,6 @@
-import { and, eq, inArray, lt, or, sql, isNull } from 'drizzle-orm';
+import { and, eq, inArray, lt, notInArray, or, sql, isNull } from 'drizzle-orm';
 import type { Executor, Transaction } from '../pool.js';
-import { operations } from '../schema/index.js';
+import { operations, operationTransitions } from '../schema/index.js';
 import {
   assertOperationTransition,
   isOperationState,
@@ -8,15 +8,40 @@ import {
 } from '../../domain/operation-state.js';
 import { AppError, ErrorCode } from '../../domain/errors.js';
 
+const TERMINAL_STATES = [
+  OperationState.SUCCEEDED,
+  OperationState.REVERTED,
+  OperationState.FAILED,
+  OperationState.CANCELLED,
+];
+
+/**
+ * Every chain write this system performs is an operation. Only MINT is approval-gated and
+ * carries money; the administrative types exist so deployment and eligibility use the same
+ * durable outbox, worker, recovery and reconciliation path.
+ */
+export const OperationType = {
+  MINT: 'MINT',
+  DEPLOY_ASSET: 'DEPLOY_ASSET',
+  SYNC_ELIGIBILITY: 'SYNC_ELIGIBILITY',
+} as const;
+
+export type OperationType = (typeof OperationType)[keyof typeof OperationType];
+
 export interface OperationRecord {
   readonly id: string;
   readonly organizationId: string;
   readonly type: string;
   readonly state: OperationState;
   readonly assetId: string;
-  readonly walletId: string;
-  readonly amount: string;
-  readonly operationReference: string;
+  /** Null for DEPLOY_ASSET. */
+  readonly walletId: string | null;
+  /** Null for everything but MINT. */
+  readonly amount: string | null;
+  /** Null for everything but MINT. */
+  readonly operationReference: string | null;
+  /** Set only for SYNC_ELIGIBILITY. */
+  readonly complianceDecisionId: string | null;
   readonly proposalHash: string;
   readonly requiredApprovals: number;
   readonly requestedBy: string;
@@ -37,28 +62,67 @@ function toRecord(row: typeof operations.$inferSelect): OperationRecord {
   return { ...row, state: row.state };
 }
 
-export interface InsertOperationInput {
-  readonly organizationId: string;
-  readonly assetId: string;
-  readonly walletId: string;
-  readonly amount: string;
-  readonly operationReference: string;
-  readonly proposalHash: string;
-  readonly requiredApprovals: number;
-  readonly requestedBy: string;
-  readonly correlationId: string;
-}
-
-export async function insertMintOperation(
+/**
+ * Administrative operations need no approval, so they are born READY and the dispatcher
+ * can hand them straight to a worker.
+ */
+export async function insertAdministrativeOperation(
   executor: Executor,
-  input: InsertOperationInput,
+  input: {
+    type: 'DEPLOY_ASSET' | 'SYNC_ELIGIBILITY';
+    organizationId: string;
+    assetId: string;
+    walletId?: string;
+    complianceDecisionId?: string;
+    proposalHash: string;
+    requestedBy: string;
+    correlationId: string;
+  },
 ): Promise<OperationRecord> {
   const [row] = await executor
     .insert(operations)
-    .values({ ...input, type: 'MINT', state: OperationState.PENDING_APPROVAL })
+    .values({
+      type: input.type,
+      state: OperationState.READY,
+      organizationId: input.organizationId,
+      assetId: input.assetId,
+      walletId: input.walletId ?? null,
+      complianceDecisionId: input.complianceDecisionId ?? null,
+      proposalHash: input.proposalHash,
+      requiredApprovals: 0,
+      requestedBy: input.requestedBy,
+      correlationId: input.correlationId,
+    })
     .returning();
   if (row === undefined) throw new Error('failed to insert operation');
+  await recordOperationTransition(executor, {
+    operationId: row.id,
+    from: null,
+    to: OperationState.READY,
+  });
   return toRecord(row);
+}
+
+/** The live administrative operation for a target, if a previous request already created one. */
+export async function findLiveAdministrativeOperation(
+  executor: Executor,
+  input: { type: 'DEPLOY_ASSET' | 'SYNC_ELIGIBILITY'; assetId: string; walletId?: string },
+): Promise<OperationRecord | null> {
+  const [row] = await executor
+    .select()
+    .from(operations)
+    .where(
+      and(
+        eq(operations.type, input.type),
+        eq(operations.assetId, input.assetId),
+        input.walletId === undefined
+          ? isNull(operations.walletId)
+          : eq(operations.walletId, input.walletId),
+        notInArray(operations.state, TERMINAL_STATES),
+      ),
+    )
+    .limit(1);
+  return row === undefined ? null : toRecord(row);
 }
 
 export async function findOperationById(
@@ -96,6 +160,36 @@ export interface TransitionPatch {
 }
 
 /**
+ * Appends to the durable timeline. Always called with the same executor as the state
+ * change, so the history can never disagree with the operation row.
+ */
+export async function recordOperationTransition(
+  executor: Executor,
+  input: { operationId: string; from: OperationState | null; to: OperationState },
+): Promise<void> {
+  await executor
+    .insert(operationTransitions)
+    .values({ operationId: input.operationId, fromState: input.from, toState: input.to });
+}
+
+export interface OperationTransitionRow {
+  readonly state: string;
+  readonly at: Date;
+}
+
+export async function listOperationHistory(
+  executor: Executor,
+  operationId: string,
+): Promise<OperationTransitionRow[]> {
+  const rows = await executor
+    .select({ state: operationTransitions.toState, at: operationTransitions.occurredAt })
+    .from(operationTransitions)
+    .where(eq(operationTransitions.operationId, operationId))
+    .orderBy(operationTransitions.id);
+  return rows;
+}
+
+/**
  * Applies a state transition, rejecting any edge the domain machine forbids.
  *
  * The UPDATE is additionally guarded on the observed `state`, so even without a prior
@@ -130,6 +224,12 @@ export async function transitionOperation(
       { details: { operationId: input.operation.id, expectedState: input.operation.state } },
     );
   }
+
+  await recordOperationTransition(executor, {
+    operationId: input.operation.id,
+    from: input.operation.state,
+    to: input.to,
+  });
   return toRecord(row);
 }
 

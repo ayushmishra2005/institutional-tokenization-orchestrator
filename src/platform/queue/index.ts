@@ -1,10 +1,10 @@
 import { Queue, Worker, type ConnectionOptions, type Processor } from 'bullmq';
 import IORedis from 'ioredis';
 
-export const MINT_QUEUE = 'mint-operations';
+export const OPERATION_QUEUE = 'chain-operations';
 
 /** BullMQ carries identifiers only; PostgreSQL holds the financial truth. */
-export interface MintJobData {
+export interface OperationJobData {
   readonly operationId: string;
   readonly outboxId: string | null;
   readonly correlationId: string;
@@ -17,8 +17,11 @@ export function createRedisConnection(url: string): IORedis {
   });
 }
 
-export function createMintQueue(connection: ConnectionOptions, prefix: string): Queue<MintJobData> {
-  return new Queue<MintJobData>(MINT_QUEUE, {
+export function createOperationQueue(
+  connection: ConnectionOptions,
+  prefix: string,
+): Queue<OperationJobData> {
+  return new Queue<OperationJobData>(OPERATION_QUEUE, {
     connection,
     prefix,
     defaultJobOptions: {
@@ -30,11 +33,15 @@ export function createMintQueue(connection: ConnectionOptions, prefix: string): 
   });
 }
 
-export function createMintWorker(
+export function createOperationWorker(
   connection: ConnectionOptions,
   prefix: string,
   concurrency: number,
-  processor: Processor<MintJobData>,
-): Worker<MintJobData> {
-  return new Worker<MintJobData>(MINT_QUEUE, processor, { connection, prefix, concurrency });
+  processor: Processor<OperationJobData>,
+): Worker<OperationJobData> {
+  return new Worker<OperationJobData>(OPERATION_QUEUE, processor, {
+    connection,
+    prefix,
+    concurrency,
+  });
 }

@@ -2,7 +2,7 @@ import type { Queue } from 'bullmq';
 import type { Database } from '../../db/pool.js';
 import type { EvmGateway } from '../../ports/evm-gateway.js';
 import type { ChainWriter } from './chain-writer.js';
-import type { MintExecutor } from '../operations/mint-executor.js';
+import type { OperationExecutor } from '../operations/operation-executor.js';
 import {
   findStaleOperations,
   lockOperation,
@@ -14,12 +14,10 @@ import {
   findLatestAttemptForOperation,
   updateAttemptStatus,
 } from '../../db/repositories/transaction-repository.js';
-import { findAssetById } from '../../db/repositories/asset-repository.js';
-import { findWalletById } from '../../db/repositories/wallet-repository.js';
 import { recordAuditEvent } from '../../db/repositories/audit-repository.js';
 import { OperationState } from '../../domain/operation-state.js';
 import { systemActor } from '../../domain/roles.js';
-import type { MintJobData } from '../../platform/queue/index.js';
+import type { OperationJobData } from '../../platform/queue/index.js';
 import type { Metrics } from '../../platform/metrics/index.js';
 import type { Logger } from '../../platform/logging/index.js';
 
@@ -36,10 +34,8 @@ export interface RecoverySummary {
 }
 
 /**
- * Rebuilds work from PostgreSQL when Redis or a worker lets it slip.
- *
- * This is what makes Redis a pure delivery mechanism: wiping the queue loses nothing,
- * because every unfinished operation is still discoverable from its own state, and
+ * Rebuilds work from PostgreSQL when Redis or a worker lets it slip. This is what makes
+ * Redis pure delivery: every unfinished operation is discoverable from its own state, and
  * every signed transaction can be re-sent byte-for-byte rather than re-created.
  */
 export class RecoveryService {
@@ -50,8 +46,8 @@ export class RecoveryService {
       db: Database;
       gateway: EvmGateway;
       chainWriter: ChainWriter;
-      executor: MintExecutor;
-      queue: Queue<MintJobData>;
+      executor: OperationExecutor;
+      queue: Queue<OperationJobData>;
       metrics: Metrics;
       logger: Logger;
       options: RecoveryOptions;
@@ -116,7 +112,7 @@ export class RecoveryService {
 
   private async requeue(operation: OperationRecord): Promise<void> {
     await this.deps.queue.add(
-      'mint.operation.ready',
+      'operation.ready',
       { operationId: operation.id, outboxId: null, correlationId: operation.correlationId },
       { jobId: `recovery-${operation.id}-${Date.now()}` },
     );
@@ -166,12 +162,9 @@ export class RecoveryService {
   }
 
   /**
-   * Resolves an operation that may or may not have a transaction on chain.
-   *
-   * Order matters: look the hash up first, because if a receipt exists the transaction
-   * definitively landed and re-sending would be pointless. Only when the chain has never
-   * seen it do we re-send the IDENTICAL persisted bytes. A new transaction is never
-   * constructed here - that is what would risk minting twice.
+   * Order matters: look the hash up first, because a receipt proves the transaction landed
+   * and re-sending would be pointless. Only if the chain has never seen it are the
+   * IDENTICAL persisted bytes re-sent. Constructing a new transaction here could mint twice.
    */
   private async resolveInFlight(
     operation: OperationRecord,
@@ -205,7 +198,12 @@ export class RecoveryService {
     });
 
     this.deps.logger.warn(
-      { operationId: operation.id, transactionHash: hash, attemptId: attempt.id },
+      {
+        operationId: operation.id,
+        transactionAttemptId: attempt.id,
+        transactionHash: hash,
+        recoveryAction: 'REBROADCAST_IDENTICAL_BYTES',
+      },
       'rebroadcasting identical signed bytes',
     );
 
@@ -240,7 +238,7 @@ export class RecoveryService {
       ) {
         await transitionOperation(tx, { operation: current, to: OperationState.SUBMITTED });
         this.deps.logger.info(
-          { operationId: operation.id, transactionHash: hash },
+          { operationId: operation.id, transactionHash: hash, recoveryAction: 'HASH_LOOKUP' },
           'resolved ambiguous broadcast: transaction found on chain',
         );
       }
@@ -252,17 +250,11 @@ export class RecoveryService {
     const attempt = await findLatestAttemptForOperation(this.deps.db, operation.id);
     if (attempt === null || attempt.transactionHash === null) return false;
 
-    const asset = await findAssetById(this.deps.db, operation.assetId);
-    const wallet = await findWalletById(this.deps.db, operation.walletId);
-    if (asset === null || asset.contractAddress === null || wallet === null) return false;
-
     const result = await this.deps.executor.observeAndFinalize({
       operationId: operation.id,
       attemptId: attempt.id,
       transactionHash: attempt.transactionHash as `0x${string}`,
-      contractAddress: asset.contractAddress as `0x${string}`,
-      recipient: wallet.address as `0x${string}`,
-      log: this.deps.logger.child({ operationId: operation.id, recovery: true }),
+      log: this.deps.logger.child({ operationId: operation.id, recoveryAction: 'FINALIZE' }),
     });
     return result.kind === 'SUCCEEDED' || result.kind === 'REVERTED';
   }

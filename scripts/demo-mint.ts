@@ -1,11 +1,7 @@
 /**
- * End-to-end local demonstration of the mint vertical slice.
- *
- * Runs the API in-process (via light-my-request style injection), starts a real worker
- * against Redis/BullMQ and drives a mint through approval, signing, broadcast,
- * confirmation and reconciliation on a local Anvil chain.
- *
- * No private key material is printed.
+ * Drives the whole local slice: API in-process, a real BullMQ worker, and every chain
+ * write (deployment, eligibility, mint) carried through the asynchronous operation path
+ * to confirmation and reconciliation on Anvil.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createContainer } from '../src/platform/container.js';
@@ -13,12 +9,10 @@ import { getConfig } from '../src/platform/config/index.js';
 import { buildApp } from '../src/api/app.js';
 import { startWorkerRuntime } from '../src/worker/runtime.js';
 import { bootstrapDevUsers } from '../src/platform/bootstrap.js';
-import { OperationState } from '../src/domain/operation-state.js';
 
 const step = (message: string): void => console.log(`  ${message}`);
 
-// Progress is the output here, so routine logs are suppressed. Warnings and errors
-// still print, since a silent demo that quietly went wrong would be worse than noisy.
+// Progress output is the point here; warnings and errors still print.
 const container = await createContainer({
   serviceName: 'demo',
   migrate: true,
@@ -33,7 +27,9 @@ const suffix = randomUUID().slice(0, 4).toUpperCase();
 
 interface OperationView {
   state: string;
-  transactionAttempts: { transactionHash: string | null; status: string }[];
+  type: string;
+  transactionHash: string | null;
+  history: { state: string; at: string }[];
   reconciliation: { kind: string; matched: boolean }[];
 }
 
@@ -49,10 +45,34 @@ function expectStatus(response: JsonResponse, expected: number, label: string): 
   }
 }
 
+const TERMINAL = ['SUCCEEDED', 'REVERTED', 'FAILED', 'CANCELLED'];
+
+/** Polls until the worker carries an operation to a terminal state. */
+async function awaitOperation(operationId: string, label: string): Promise<OperationView> {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    const response = (await app.inject({
+      method: 'GET',
+      url: `/v1/operations/${operationId}`,
+      headers: auth(users['dev-issuer'].token),
+    })) as JsonResponse;
+    expectStatus(response, 200, `read ${label}`);
+    const operation = response.json<OperationView>();
+
+    if (TERMINAL.includes(operation.state)) {
+      if (operation.state !== 'SUCCEEDED') {
+        throw new Error(`${label} ended in ${operation.state}`);
+      }
+      return operation;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`${label} did not reach a terminal state`);
+}
+
 try {
   console.log('\nInstitutional tokenization orchestrator - local mint demo\n');
 
-  // 1. asset
   const assetResponse = (await app.inject({
     method: 'POST',
     url: '/v1/assets',
@@ -64,14 +84,26 @@ try {
       supplyCap: '1000000000000000000000000',
     },
   })) as JsonResponse;
-  expectStatus(assetResponse, 201, 'create asset');
-  const asset = assetResponse.json<{ id: string; symbol: string; contractAddress: string }>();
-  step(`asset created            ${asset.symbol} (${asset.id})`);
-  step(`contract deployed        ${asset.contractAddress}`);
+  expectStatus(assetResponse, 202, 'create asset');
+  const asset = assetResponse.json<{
+    id: string;
+    symbol: string;
+    provisioningOperationId: string;
+  }>();
+  step(`asset accepted           ${asset.symbol} (${asset.id})`);
 
-  // 2. wallet
+  const deployment = await awaitOperation(asset.provisioningOperationId, 'asset deployment');
+  const assetView = (await app.inject({
+    method: 'GET',
+    url: `/v1/assets/${asset.id}`,
+    headers: auth(users['dev-issuer'].token),
+  })) as JsonResponse;
+  expectStatus(assetView, 200, 'get asset');
+  const contractAddress = assetView.json<{ contractAddress: string }>().contractAddress;
+  step(`contract deployed        ${contractAddress}`);
+  step(`deployment tx            ${deployment.transactionHash}`);
+
   // A fresh recipient each run keeps the demo repeatable against a persistent database.
-  // The recipient only ever receives tokens, so it needs no funded key.
   const recipient = `0x${randomBytes(20).toString('hex')}`;
   const walletResponse = (await app.inject({
     method: 'POST',
@@ -87,18 +119,21 @@ try {
   const wallet = walletResponse.json<{ id: string; address: string }>();
   step(`wallet registered        ${wallet.address}`);
 
-  // 3. compliance
   const complianceResponse = (await app.inject({
     method: 'POST',
     url: `/v1/wallets/${wallet.id}/compliance-decisions`,
     headers: auth(users['dev-compliance'].token),
     payload: { assetId: asset.id },
   })) as JsonResponse;
-  expectStatus(complianceResponse, 201, 'compliance decision');
-  const compliance = complianceResponse.json<{ status: string; chainSyncStatus: string }>();
+  expectStatus(complianceResponse, 202, 'compliance decision');
+  const compliance = complianceResponse.json<{
+    status: string;
+    eligibilityOperationId: string;
+  }>();
   step(`compliance approved      status=${compliance.status} (mock provider, not real KYC)`);
+  await awaitOperation(compliance.eligibilityOperationId, 'eligibility sync');
+  step('eligibility synced       on chain');
 
-  // 4. mint request
   const amount = '2500000000000000000000';
   const mintResponse = (await app.inject({
     method: 'POST',
@@ -110,7 +145,6 @@ try {
   const mint = mintResponse.json<{ operationId: string; approvalRequestId: string }>();
   step(`mint requested           operation=${mint.operationId}`);
 
-  // 5. two independent approvals
   for (const [index, approver] of ['dev-approver-1', 'dev-approver-2'].entries()) {
     const decision = (await app.inject({
       method: 'POST',
@@ -123,62 +157,23 @@ try {
     step(
       `approval ${index + 1} recorded       approvals=${result.approvalsRecorded} operation=${result.operationState}`,
     );
-    if (index === 1) step(`operation ready          ${result.operationState}`);
   }
 
-  // 6. wait for the worker to carry the operation through to a terminal state
-  const deadline = Date.now() + 120_000;
-  let operation: OperationView | null = null;
-  const seen = new Set<string>();
-
-  while (Date.now() < deadline) {
-    const response = (await app.inject({
-      method: 'GET',
-      url: `/v1/operations/${mint.operationId}`,
-      headers: auth(users['dev-issuer'].token),
-    })) as JsonResponse;
-    expectStatus(response, 200, 'get operation');
-    operation = response.json<OperationView>();
-
-    if (!seen.has(operation.state)) {
-      seen.add(operation.state);
-      if (operation.state === OperationState.SUBMITTED) step('transaction submitted    on chain');
-      if (operation.state === OperationState.INCLUDED) step('transaction confirmed    receipt observed');
-    }
-
-    if (
-      operation.state === OperationState.SUCCEEDED ||
-      operation.state === OperationState.REVERTED ||
-      operation.state === OperationState.FAILED ||
-      operation.state === OperationState.CANCELLED
-    ) {
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-
-  if (operation === null) throw new Error('operation was never observed');
-  if (operation.state !== OperationState.SUCCEEDED) {
-    throw new Error(`operation ended in ${operation.state}, expected SUCCEEDED`);
-  }
+  const operation = await awaitOperation(mint.operationId, 'mint');
+  step(`operation history        ${operation.history.map((entry) => entry.state).join(' -> ')}`);
 
   const matched = operation.reconciliation.filter((entry) => entry.matched).length;
   step(`mint reconciled          ${matched}/${operation.reconciliation.length} chain checks matched`);
-  step(`operation succeeded      ${operation.state}`);
-
-  const transactionHash =
-    operation.transactionAttempts.find((attempt) => attempt.transactionHash !== null)
-      ?.transactionHash ?? 'unknown';
 
   const balance = await container.gateway.readBalanceOf(
-    asset.contractAddress as `0x${string}`,
+    contractAddress as `0x${string}`,
     recipient as `0x${string}`,
   );
 
   console.log('\nResult');
   console.log(`  operation ID:      ${mint.operationId}`);
-  console.log(`  transaction hash:  ${transactionHash}`);
-  console.log(`  contract address:  ${asset.contractAddress}`);
+  console.log(`  transaction hash:  ${operation.transactionHash ?? 'unknown'}`);
+  console.log(`  contract address:  ${contractAddress}`);
   console.log(`  recipient:         ${recipient}`);
   console.log(`  minted amount:     ${amount} base units (recipient balance ${balance})`);
   console.log(`  final state:       ${operation.state}\n`);

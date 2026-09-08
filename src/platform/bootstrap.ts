@@ -26,12 +26,7 @@ export interface BootstrappedUser {
   readonly token: string;
 }
 
-/**
- * Idempotently provisions the local personas and issues tokens for them.
- *
- * DEVELOPMENT ONLY: a real deployment would provision identities through an external
- * identity provider rather than minting its own tokens.
- */
+/** Idempotently provisions the local personas and issues their tokens. Development only. */
 export async function bootstrapDevUsers(
   db: Database,
   auth: DevJwtAuthenticator,

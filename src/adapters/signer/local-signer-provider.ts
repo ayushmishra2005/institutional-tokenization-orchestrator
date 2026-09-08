@@ -46,9 +46,8 @@ export class LocalSignerProvider implements SignerProvider {
     request: UnsignedTransactionRequest,
     context: SigningPolicyContext,
   ): Promise<SignerResult> {
-    // A real signer would apply custody policy here. The local adapter still refuses
-    // anything that does not match its own identity, chain, or value policy, so a bug
-    // upstream cannot turn this into a general-purpose signing oracle.
+    // Refuses anything that does not match this signer's own identity, chain or value
+    // policy, so an upstream bug cannot turn it into a general-purpose signing oracle.
     if (request.chainId !== this.chainId) {
       return {
         kind: 'REJECTED',

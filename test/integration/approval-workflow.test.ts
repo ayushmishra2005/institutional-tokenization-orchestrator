@@ -189,6 +189,26 @@ describe('two-person approval workflow', () => {
     expect(later.json<{ error: { code: string } }>().error.code).toBe('APPROVAL_REQUEST_CLOSED');
   });
 
+  it('does not both approve and cancel when a rejection races the final approval', async () => {
+    const mint = await requestMint(harness, seed);
+    expect((await decide(mint.approvalRequestId, 'dev-approver-1')).statusCode).toBe(200);
+
+    const [approval, rejection] = await Promise.all([
+      decide(mint.approvalRequestId, 'dev-approver-2', 'APPROVE'),
+      decide(mint.approvalRequestId, 'dev-approver-2', 'REJECT'),
+    ]);
+
+    const accepted = [approval, rejection].filter((response) => response.statusCode === 200);
+    expect(accepted).toHaveLength(1);
+
+    const [operation] = await harness.container.db
+      .select()
+      .from(operations)
+      .where(eq(operations.id, mint.operationId));
+    expect([OperationState.READY, OperationState.CANCELLED]).toContain(operation!.state);
+    expect(accepted[0]!.json<{ operationState: string }>().operationState).toBe(operation!.state);
+  });
+
   it('supersedes approvals when the financial intent changes', async () => {
     const mint = await requestMint(harness, seed);
     expect((await decide(mint.approvalRequestId, 'dev-approver-1')).statusCode).toBe(200);

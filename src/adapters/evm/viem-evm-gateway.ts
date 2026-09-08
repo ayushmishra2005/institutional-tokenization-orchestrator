@@ -35,10 +35,8 @@ export interface ViemGatewayOptions {
 }
 
 /**
- * viem-backed implementation of {@link EvmGateway}.
- *
- * This is the only module permitted to import viem for chain access. It exposes a small
- * set of explicit, allowlisted operations rather than a generic contract-call facade.
+ * The only module permitted to import viem for chain access. Exposes explicit allowlisted
+ * operations rather than a generic contract-call facade.
  */
 export class ViemEvmGateway implements EvmGateway {
   private readonly client: PublicClient;
@@ -120,8 +118,6 @@ export class ViemEvmGateway implements EvmGateway {
     );
   }
 
-  // --- allowlisted encoders ---------------------------------------------
-
   encodeTokenDeployment(params: TokenDeploymentParams): EncodedCall {
     return {
       to: null,
@@ -163,8 +159,6 @@ export class ViemEvmGateway implements EvmGateway {
       }),
     };
   }
-
-  // --- simulation / execution -------------------------------------------
 
   async simulate(input: {
     from: `0x${string}`;
@@ -256,8 +250,6 @@ export class ViemEvmGateway implements EvmGateway {
     }
     return events;
   }
-
-  // --- reads -------------------------------------------------------------
 
   private read<T>(contract: `0x${string}`, functionName: string, args: readonly unknown[] = []) {
     return this.rpc(`eth_call:${functionName}`, () =>

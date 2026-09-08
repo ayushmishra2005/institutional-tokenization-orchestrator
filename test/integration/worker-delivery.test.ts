@@ -80,7 +80,7 @@ describe('worker delivery semantics', () => {
     await waitForState(harness, mint.operationId, (value) => value === OperationState.SUCCEEDED);
 
     // Replaying the job after settlement must be a no-op, not a second mint.
-    const result = await harness.container.mintExecutor.execute(mint.operationId, 'replay-worker');
+    const result = await harness.container.operationExecutor.execute(mint.operationId, 'replay-worker');
     expect(result.kind).toBe('SKIPPED');
 
     const attempts = await listAttemptsForOperation(harness.container.db, mint.operationId);

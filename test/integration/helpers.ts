@@ -114,7 +114,23 @@ export interface SeededAsset {
   readonly recipient: `0x${string}`;
 }
 
-/** Creates an active asset, a registered wallet and an approved compliance decision. */
+/**
+ * Runs an administrative operation to completion without requiring a live worker, so
+ * suites that only exercise the API still get a deployed contract. Waits rather than
+ * asserting on the return value, because a running dispatcher may win the claim race.
+ */
+export async function runOperationNow(
+  harness: TestHarness,
+  operationId: string,
+): Promise<void> {
+  await harness.container.operationExecutor.execute(operationId, 'test-runner');
+  const state = await waitForState(harness, operationId, isTerminal, 60_000);
+  if (state !== OperationState.SUCCEEDED) {
+    throw new Error(`operation ${operationId} ended in ${state}, expected SUCCEEDED`);
+  }
+}
+
+/** Creates a deployed asset, a registered wallet and a synced compliance approval. */
 export async function seedAssetAndWallet(harness: TestHarness): Promise<SeededAsset> {
   const assetResponse = await harness.app.inject({
     method: 'POST',
@@ -127,10 +143,19 @@ export async function seedAssetAndWallet(harness: TestHarness): Promise<SeededAs
       supplyCap: '1000000000000000000000000',
     },
   });
-  if (assetResponse.statusCode !== 201) {
+  if (assetResponse.statusCode !== 202) {
     throw new Error(`asset creation failed: ${assetResponse.body}`);
   }
-  const asset = assetResponse.json<{ id: string; contractAddress: string }>();
+  const asset = assetResponse.json<{ id: string; provisioningOperationId: string }>();
+  await runOperationNow(harness, asset.provisioningOperationId);
+
+  const deployed = await harness.app.inject({
+    method: 'GET',
+    url: `/v1/assets/${asset.id}`,
+    headers: harness.auth('dev-issuer'),
+  });
+  const contractAddress = deployed.json<{ contractAddress: string | null }>().contractAddress;
+  if (contractAddress === null) throw new Error('asset has no contract after deployment');
 
   const recipient = randomAddress();
   const walletResponse = await harness.app.inject({
@@ -150,13 +175,16 @@ export async function seedAssetAndWallet(harness: TestHarness): Promise<SeededAs
     headers: harness.auth('dev-compliance'),
     payload: { assetId: asset.id },
   });
-  if (complianceResponse.statusCode !== 201) {
+  if (complianceResponse.statusCode !== 202) {
     throw new Error(`compliance decision failed: ${complianceResponse.body}`);
   }
+  const eligibilityOperationId =
+    complianceResponse.json<{ eligibilityOperationId: string }>().eligibilityOperationId;
+  await runOperationNow(harness, eligibilityOperationId);
 
   return {
     assetId: asset.id,
-    contractAddress: asset.contractAddress as `0x${string}`,
+    contractAddress: contractAddress as `0x${string}`,
     walletId: wallet.id,
     recipient,
   };

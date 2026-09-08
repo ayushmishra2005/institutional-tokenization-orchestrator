@@ -4,7 +4,14 @@ import { startWorkerRuntime } from './runtime.js';
 const container = await createContainer({ serviceName: 'worker', migrate: true });
 const runtime = startWorkerRuntime(container);
 
-container.logger.info({ workerId: runtime.workerId }, 'worker started');
+const readiness = await runtime.readiness();
+container.logger.info({ workerId: runtime.workerId, ...readiness }, 'worker started');
+if (!readiness.ready) {
+  container.logger.warn(
+    readiness.checks,
+    'a dependency the worker needs is unreachable; jobs will retry until it recovers',
+  );
+}
 
 const shutdown = async (signal: string): Promise<void> => {
   container.logger.info({ signal }, 'shutting down worker');

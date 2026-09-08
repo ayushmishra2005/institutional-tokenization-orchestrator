@@ -15,14 +15,9 @@ export interface MockComplianceOptions {
 }
 
 /**
- * Deterministic development compliance adapter.
+ * Deterministic development adapter. PERFORMS NO KYC, AML OR SANCTIONS SCREENING.
  *
- * THIS PERFORMS NO KYC, AML OR SANCTIONS SCREENING. It exists so the workflow around a
- * compliance provider - decision persistence, expiry, and the mandatory fresh re-check
- * before execution - can be built and tested end to end.
- *
- * Rule: a subject reference containing "blocked" (case-insensitive) is rejected.
- * Everything else is approved. Rejections are also injectable for tests.
+ * A subject reference containing "blocked" is rejected; everything else is approved.
  */
 export class MockComplianceProvider implements ComplianceProvider {
   readonly name = 'mock-local';

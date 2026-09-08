@@ -5,8 +5,8 @@ creation, investor wallet registration, compliance decisions, two-person approva
 EVM transaction orchestration with a signer boundary, and asynchronous reconciliation
 with a full audit trail.
 
-Phase 1 implements one complete vertical slice — an approved mint executed against a
-local EVM chain and reconciled back into PostgreSQL — rather than a broad API surface.
+The scope is one complete vertical slice — an approved mint executed against a local EVM
+chain and reconciled back into PostgreSQL — rather than a broad API surface.
 
 > **This is an open-source reference implementation / engineering project. It is NOT
 > production-ready financial infrastructure.** The local signer and the mock compliance
@@ -123,10 +123,16 @@ pnpm test:integration   # requires pnpm infra:up
 ```
 
 Integration suites share one PostgreSQL/Redis/Anvil stack and therefore run serially.
-They cover the end-to-end mint, idempotency, approval concurrency, database-level
-concurrency (outbox claiming, nonce reservation, audit immutability), transport faults
-(ambiguous broadcast, exact-byte rebroadcast, on-chain revert), and worker delivery
-semantics (duplicate delivery, lost queue message).
+They cover the end-to-end mint, idempotency under 100 concurrent duplicate requests,
+approval concurrency, database-level concurrency (outbox claiming against the database
+clock, nonce reservation, audit immutability), transport faults (ambiguous broadcast,
+exact-byte rebroadcast, on-chain revert, signer and compliance rejection), worker
+delivery semantics (duplicate delivery, lost queue message), and crash recovery
+(undispatched outbox, abandoned nonce reservation, receipt lookup lost mid-confirmation,
+full Redis flush).
+
+CI (`.github/workflows/ci.yml`) runs typecheck, lint, unit tests and Foundry tests. The
+integration suites need the full local stack and are run locally, not in CI.
 
 ## API
 
@@ -137,15 +143,15 @@ Authorization is enforced in the application services, not only in route handler
 
 | Method | Path | Role | Notes |
 | --- | --- | --- | --- |
-| `POST` | `/v1/assets` | ISSUER, ADMIN | Deploys the token contract; `201` |
+| `POST` | `/v1/assets` | ISSUER, ADMIN | Queues the token deployment; `202` with a provisioning operation ID |
 | `GET` | `/v1/assets/{assetId}` | any | Asset and contract address |
 | `POST` | `/v1/wallets` | ISSUER, ADMIN | Registers an investor wallet; `201` |
-| `POST` | `/v1/wallets/{walletId}/compliance-decisions` | COMPLIANCE_OFFICER, ADMIN | Records a decision and mirrors eligibility on chain; `201` |
+| `POST` | `/v1/wallets/{walletId}/compliance-decisions` | COMPLIANCE_OFFICER, ADMIN | Records the decision and queues the on-chain eligibility sync; `202` |
 | `POST` | `/v1/assets/{assetId}/mints` | ISSUER, ADMIN | Requires `Idempotency-Key`; returns `202` with an operation ID |
 | `POST` | `/v1/approval-requests/{requestId}/decisions` | APPROVER | `APPROVE` or `REJECT` |
-| `GET` | `/v1/operations/{operationId}` | any | State, transaction attempts, reconciliation findings |
+| `GET` | `/v1/operations/{operationId}` | any | State, transition history, transaction attempts, reconciliation findings |
 | `GET` | `/v1/audit-events` | AUDITOR, ADMIN | Append-only audit trail |
-| `GET` | `/health/live`, `/health/ready` | none | Readiness checks PostgreSQL, Redis and the RPC endpoint |
+| `GET` | `/health/live`, `/health/ready` | none | API readiness checks PostgreSQL, its only synchronous dependency |
 | `GET` | `/metrics` | none | Prometheus exposition |
 
 Errors use a stable envelope with a machine-readable code and never include stack
@@ -175,3 +181,16 @@ traces:
 - `.env` is git-ignored. No secrets belong in this repository.
 - The token contract implements ERC-20 only. It does **not** implement ERC-1400,
   ERC-1404 or any other security-token standard, and claims no such support.
+
+## Limitations
+
+- One EVM chain, one local signer lane. No HSM, KMS, MPC or external custody.
+- No fee replacement (RBF) or gas escalation: a stuck transaction stays stuck until an
+  operator intervenes.
+- Reconciliation findings are persisted and exposed through the operations API; there is
+  no resolution workflow or UI.
+- Compliance is a mock adapter with no KYC, AML or sanctions screening.
+- Finality on Anvil is approximated by a small confirmation depth; reorgs are not
+  modelled.
+- Single-process deployment model. No deployment tooling, no cloud, no testnet or
+  mainnet configuration.

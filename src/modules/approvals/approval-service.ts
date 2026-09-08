@@ -109,7 +109,8 @@ export class ApprovalService {
       // wallet configuration changed, the snapshot no longer describes what would
       // happen, so the request is superseded instead of silently reused.
       const asset = await findAssetById(tx, operation.assetId);
-      const wallet = await findWalletById(tx, operation.walletId);
+      const wallet =
+        operation.walletId === null ? null : await findWalletById(tx, operation.walletId);
       if (asset === null || wallet === null) {
         throw new NotFoundError('operation', operation.id);
       }
@@ -207,7 +208,7 @@ export class ApprovalService {
         // transaction rolls back, no job is ever produced; if it commits, the work
         // survives even with Redis wiped.
         await enqueueOutbox(tx, {
-          topic: OutboxTopic.MINT_OPERATION_READY,
+          topic: OutboxTopic.OPERATION_READY,
           aggregateType: 'operation',
           aggregateId: operation.id,
           payload: { operationId: operation.id },

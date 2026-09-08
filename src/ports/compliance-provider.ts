@@ -1,8 +1,6 @@
 /**
- * Compliance screening port.
- *
- * Phase 1 ships only a deterministic mock adapter. Nothing behind this interface
- * performs real KYC, AML, sanctions or identity verification.
+ * Only a deterministic mock adapter is implemented. Nothing behind this interface performs
+ * real KYC, AML, sanctions or identity verification.
  */
 
 export const ComplianceStatus = {

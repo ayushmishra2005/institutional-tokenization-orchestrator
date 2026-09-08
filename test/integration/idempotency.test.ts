@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createHarness, seedAssetAndWallet, type SeededAsset, type TestHarness } from './helpers.js';
 import { operations } from '../../src/db/schema/index.js';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 
 describe('idempotent mint requests', () => {
   let harness: TestHarness;
@@ -52,7 +52,6 @@ describe('idempotent mint requests', () => {
       first.json<{ operationId: string }>().operationId,
     );
 
-    // Exactly one operation exists for that intent.
     const rows = await harness.container.db
       .select()
       .from(operations)
@@ -73,9 +72,7 @@ describe('idempotent mint requests', () => {
     const key = `key-${randomUUID()}`;
     const payload = { walletId: seed.walletId, amount: '3000000000000000000' };
 
-    const responses = await Promise.all(
-      Array.from({ length: 8 }, () => post(key, payload)),
-    );
+    const responses = await Promise.all(Array.from({ length: 100 }, () => post(key, payload)));
 
     const accepted = responses.filter((response) => response.statusCode === 202);
     const inProgress = responses.filter((response) => response.statusCode === 409);
@@ -95,6 +92,28 @@ describe('idempotent mint requests', () => {
         'IDEMPOTENCY_IN_PROGRESS',
       );
     }
+
+    const withThisIntent = await harness.container.db
+      .select()
+      .from(operations)
+      .where(and(eq(operations.walletId, seed.walletId), eq(operations.amount, payload.amount)));
+    expect(withThisIntent).toHaveLength(1);
+  });
+
+  it('replays the original response when a timed-out client retries', async () => {
+    const key = `key-${randomUUID()}`;
+    const payload = { walletId: seed.walletId, amount: '4000000000000000000' };
+
+    // The client gave up on the response it never saw; the server had already committed.
+    const abandoned = await post(key, payload);
+    expect(abandoned.statusCode).toBe(202);
+
+    const retried = await post(key, payload);
+    expect(retried.statusCode).toBe(202);
+    expect(retried.headers['idempotent-replay']).toBe('true');
+    expect(retried.json<{ operationId: string }>().operationId).toBe(
+      abandoned.json<{ operationId: string }>().operationId,
+    );
   });
 
   it('scopes keys per actor so two actors cannot collide', async () => {

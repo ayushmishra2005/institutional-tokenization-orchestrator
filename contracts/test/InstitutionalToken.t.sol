@@ -40,8 +40,6 @@ contract InstitutionalTokenTest is Test {
         return uint64(block.timestamp + 1 hours);
     }
 
-    // --- construction ------------------------------------------------------
-
     function test_Constructor_SetsMetadataRolesAndCap() public view {
         assertEq(token.name(), "Demo Fund Token");
         assertEq(token.symbol(), "DFT");
@@ -63,8 +61,6 @@ contract InstitutionalTokenTest is Test {
         vm.expectRevert(abi.encodeWithSelector(InstitutionalToken.InvalidRecipient.selector, address(0)));
         new InstitutionalToken("X", "X", 18, CAP, address(0), minter, compliance, pauser);
     }
-
-    // --- eligibility -------------------------------------------------------
 
     function test_SetEligibility_EmitsEventAndFlipsIsEligible() public {
         uint64 until = uint64(block.timestamp + 30 days);
@@ -93,8 +89,6 @@ contract InstitutionalTokenTest is Test {
         _makeEligible(investor, 0);
         assertFalse(token.isEligible(investor));
     }
-
-    // --- happy path --------------------------------------------------------
 
     function test_MintWithReference_HappyPath() public {
         _makeEligible(investor, uint64(block.timestamp + 30 days));
@@ -143,8 +137,6 @@ contract InstitutionalTokenTest is Test {
         token.mintWithReference(investor, 1e18, keccak256("op-edge-2"), _deadline());
         assertEq(token.balanceOf(investor), 1e18);
     }
-
-    // --- adversarial -------------------------------------------------------
 
     function test_MintWithReference_RevertsForUnauthorizedCaller() public {
         _makeEligible(investor, uint64(block.timestamp + 30 days));
@@ -326,8 +318,6 @@ contract InstitutionalTokenTest is Test {
         assertTrue(token.referenceConsumed(ref));
     }
 
-    // --- transfer restrictions --------------------------------------------
-
     function test_Transfer_RevertsWhenRecipientIneligible() public {
         _makeEligible(investor, uint64(block.timestamp + 30 days));
         vm.prank(minter);
@@ -365,8 +355,6 @@ contract InstitutionalTokenTest is Test {
         vm.prank(investor);
         token.transfer(outsider, 1e18);
     }
-
-    // --- fuzz --------------------------------------------------------------
 
     function testFuzz_MintWithReference_NeverExceedsCap(uint256 amount) public {
         amount = bound(amount, 1, CAP * 2);

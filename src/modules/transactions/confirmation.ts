@@ -16,12 +16,9 @@ export type ConfirmationOutcome =
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Waits for inclusion and then for the configured depth.
- *
- * Inclusion and finality are deliberately separate: a receipt only proves the
- * transaction was in *a* block. On a local Anvil chain a small confirmation depth is a
- * deterministic stand-in for finality and nothing more - it does not model mainnet
- * reorg risk or any real finality guarantee.
+ * Inclusion and finality are separate: a receipt only proves the transaction was in *a*
+ * block. On Anvil a small confirmation depth is a deterministic stand-in for finality and
+ * nothing more - it does not model reorg risk.
  */
 export async function awaitConfirmation(
   gateway: EvmGateway,

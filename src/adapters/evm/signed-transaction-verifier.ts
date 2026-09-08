@@ -16,12 +16,9 @@ function mismatch(field: string, expected: unknown, actual: unknown): never {
 }
 
 /**
- * Independently validates bytes returned by a SignerProvider against the exact request
- * that was committed to PostgreSQL before signing.
- *
- * The signer is treated as untrusted: a compromised or buggy adapter must not be able to
- * substitute a different recipient, amount, calldata, chain, nonce or fee. Nothing is
- * broadcast until every field below matches and the recovered signer is the expected one.
+ * Validates bytes returned by a SignerProvider against the exact request committed before
+ * signing. The signer is untrusted: a compromised adapter must not be able to substitute a
+ * different recipient, amount, calldata, chain, nonce or fee.
  */
 export async function verifySignedTransaction(
   signedTransaction: `0x${string}`,

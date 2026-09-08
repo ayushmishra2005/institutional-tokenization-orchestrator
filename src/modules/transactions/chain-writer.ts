@@ -77,9 +77,8 @@ export interface ChainWriterDeps {
 /**
  * Executes a single allowlisted chain write with persist-before-broadcast semantics.
  *
- * Transaction boundaries are deliberately narrow: every RPC call, signer call and
- * broadcast happens with no PostgreSQL transaction open. Each durable step commits on
- * its own so a crash at any point leaves a recoverable, unambiguous record.
+ * Every RPC call, signer call and broadcast runs with no PostgreSQL transaction open, and
+ * each durable step commits on its own, so a crash at any point leaves an unambiguous record.
  */
 export class ChainWriter {
   constructor(private readonly deps: ChainWriterDeps) {}
@@ -88,7 +87,6 @@ export class ChainWriter {
     const { db, gateway, signer, logger } = this.deps;
     const signerAddress = await signer.getSignerAddress();
 
-    // --- outside any transaction: chain identity, simulation, fees, nonce ---
     await gateway.getChainIdentity();
 
     const simulation = await gateway.simulate({
@@ -107,7 +105,6 @@ export class ChainWriter {
     const chainNonce = await gateway.getTransactionCount(signerAddress, 'latest');
     const gasLimit = (simulation.gasEstimate * GAS_BUFFER_NUMERATOR) / GAS_BUFFER_DENOMINATOR;
 
-    // --- commit 1: reserve nonce + record the prepared attempt ---
     const attempt = await db.transaction(async (tx) => {
       const nonce = await reserveNonce(tx, {
         chainId: this.deps.chainId,
@@ -160,7 +157,6 @@ export class ChainWriter {
       maxPriorityFeePerGas: BigInt(attempt.maxPriorityFeePerGas),
     };
 
-    // --- outside any transaction: signing ---
     const signed = await signer.sign(request, {
       purpose: intent.purpose,
       ...(intent.operationId === null ? {} : { operationId: intent.operationId }),
@@ -170,6 +166,7 @@ export class ChainWriter {
     });
 
     if (signed.kind === 'REJECTED') {
+      this.deps.metrics.signerFailures.inc({ reason: signed.code });
       await this.failAttempt(attempt, hooks, {
         code: ErrorCode.SIGNER_REJECTED,
         message: `${signed.code}: ${signed.reason}`,
@@ -192,6 +189,7 @@ export class ChainWriter {
         signed.transactionHash,
       );
     } catch (error) {
+      this.deps.metrics.signerFailures.inc({ reason: ErrorCode.SIGNED_TRANSACTION_MISMATCH });
       await this.failAttempt(attempt, hooks, {
         code: ErrorCode.SIGNED_TRANSACTION_MISMATCH,
         message: error instanceof Error ? error.message : 'signed transaction verification failed',
@@ -199,7 +197,8 @@ export class ChainWriter {
       throw error;
     }
 
-    // --- commit 2: persist exact signed bytes + hash BEFORE any broadcast ---
+    // The bytes and hash must be durable before anything is sent, so a crash mid-broadcast
+    // can be resolved by looking up this hash or resending these exact bytes.
     await db.transaction(async (tx) => {
       await persistSignedAttempt(tx, {
         attemptId: attempt.id,
@@ -209,7 +208,8 @@ export class ChainWriter {
       await hooks.onSigned?.(tx, attempt);
     });
 
-    // --- commit 3: declare intent to broadcast ---
+    // Committing BROADCASTING before the send is what makes a crash here recoverable
+    // rather than indistinguishable from "never attempted".
     await db.transaction(async (tx) => {
       await updateAttemptStatus(tx, {
         attemptId: attempt.id,

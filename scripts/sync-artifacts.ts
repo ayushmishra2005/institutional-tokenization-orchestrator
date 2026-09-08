@@ -1,7 +1,6 @@
 /**
- * Copies the compiled InstitutionalToken ABI + creation bytecode out of the Foundry
- * build directory into a committed TypeScript module, so the application can deploy
- * and encode calls without depending on `contracts/out` existing at runtime.
+ * Copies the compiled ABI and creation bytecode into a committed TypeScript module, so the
+ * application never depends on `contracts/out` existing at runtime.
  *
  * Run after changing the Solidity source: `pnpm contracts:build && pnpm contracts:sync`.
  */

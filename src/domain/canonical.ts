@@ -3,9 +3,8 @@ import { createHash } from 'node:crypto';
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
 
 /**
- * Deterministic JSON serialisation: object keys sorted, no incidental whitespace.
- * Used for idempotency request fingerprints and approval proposal snapshots, where
- * two semantically identical payloads must produce byte-identical output.
+ * Deterministic JSON: keys sorted, no incidental whitespace. Idempotency fingerprints and
+ * approval snapshots require two semantically identical payloads to serialise identically.
  */
 export function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);

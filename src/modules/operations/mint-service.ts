@@ -8,6 +8,7 @@ import { findActiveApproval } from '../../db/repositories/compliance-repository.
 import { insertApprovalRequest } from '../../db/repositories/approval-repository.js';
 import {
   findOperationById,
+  recordOperationTransition,
   type OperationRecord,
 } from '../../db/repositories/operation-repository.js';
 import { recordAuditEvent } from '../../db/repositories/audit-repository.js';
@@ -147,6 +148,12 @@ export class MintService {
           .returning();
         if (operation === undefined) throw new Error('failed to create mint operation');
 
+        await recordOperationTransition(tx, {
+          operationId: operation.id,
+          from: null,
+          to: OperationState.PENDING_APPROVAL,
+        });
+
         const approvalRequest = await insertApprovalRequest(tx, {
           operationId: operation.id,
           requiredApprovals: REQUIRED_MINT_APPROVALS,
@@ -231,8 +238,8 @@ export function rebuildMintProposal(input: {
     contractAddress: input.asset.contractAddress ?? '',
     walletId: input.wallet.id,
     recipientAddress: input.wallet.address,
-    amount: input.operation.amount,
-    operationReference: input.operation.operationReference,
+    amount: input.operation.amount ?? '',
+    operationReference: input.operation.operationReference ?? '',
     policyVersion: input.asset.policyVersion,
     requiredApprovals: input.operation.requiredApprovals,
   };

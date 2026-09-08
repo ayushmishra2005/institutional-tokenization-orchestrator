@@ -50,8 +50,6 @@ export interface TransactionAttemptRecord {
   readonly updatedAt: Date;
 }
 
-// --- nonce lane ------------------------------------------------------------
-
 /**
  * Reserves the next nonce for a signer lane.
  *
@@ -132,8 +130,6 @@ export async function readReservedNonce(
     .limit(1);
   return row?.nextNonce ?? null;
 }
-
-// --- attempts --------------------------------------------------------------
 
 export interface InsertAttemptInput {
   readonly operationId: string | null;
@@ -292,21 +288,28 @@ export async function listAttemptsForOperation(
     .orderBy(transactionAttempts.createdAt);
 }
 
-// --- reconciliation observations -------------------------------------------
+export type ObservationKind =
+  | 'RECEIPT'
+  | 'MINT_EVENT'
+  | 'REFERENCE_CONSUMED'
+  | 'RECIPIENT_BALANCE'
+  | 'TOTAL_SUPPLY'
+  | 'CHAIN_IDENTITY'
+  | 'CONTRACT_CODE'
+  | 'TOKEN_METADATA'
+  | 'ELIGIBILITY_WINDOW';
+
+export type ObservationSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
 
 export interface ObservationInput {
   readonly operationId: string | null;
   readonly transactionAttemptId: string | null;
-  readonly kind:
-    | 'RECEIPT'
-    | 'MINT_EVENT'
-    | 'REFERENCE_CONSUMED'
-    | 'RECIPIENT_BALANCE'
-    | 'TOTAL_SUPPLY';
+  readonly kind: ObservationKind;
   readonly chainId: number;
   readonly blockNumber: number | null;
   readonly transactionHash: string | null;
   readonly matched: boolean;
+  readonly severity: ObservationSeverity;
   readonly expected: unknown;
   readonly actual: unknown;
   readonly detail: string | null;
@@ -321,7 +324,34 @@ export async function recordObservation(
     transactionHash: input.transactionHash === null ? null : input.transactionHash.toLowerCase(),
     expected: input.expected ?? null,
     actual: input.actual ?? null,
+    // A matched observation is evidence, not a finding, so it is closed on arrival.
+    status: input.matched ? 'RESOLVED' : 'OPEN',
+    resolvedAt: input.matched ? new Date() : null,
   });
+}
+
+/** Unresolved reconciliation findings, newest first. */
+export async function listOpenFindings(
+  executor: Executor,
+  limit: number,
+): Promise<(typeof chainObservations.$inferSelect)[]> {
+  return executor
+    .select()
+    .from(chainObservations)
+    .where(eq(chainObservations.status, 'OPEN'))
+    .orderBy(desc(chainObservations.observedAt))
+    .limit(limit);
+}
+
+export async function countOpenFindingsBySeverity(
+  executor: Executor,
+): Promise<{ severity: string; count: number }[]> {
+  const rows = await executor
+    .select({ severity: chainObservations.severity, count: sql<string>`count(*)` })
+    .from(chainObservations)
+    .where(eq(chainObservations.status, 'OPEN'))
+    .groupBy(chainObservations.severity);
+  return rows.map((row) => ({ severity: row.severity, count: Number(row.count) }));
 }
 
 export async function listObservations(

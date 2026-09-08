@@ -3,7 +3,8 @@ import type { Executor, Transaction } from '../pool.js';
 import { outbox } from '../schema/index.js';
 
 export const OutboxTopic = {
-  MINT_OPERATION_READY: 'mint.operation.ready',
+  /** Every operation type shares one topic; the worker resolves the type from PostgreSQL. */
+  OPERATION_READY: 'operation.ready',
 } as const;
 
 export type OutboxTopic = (typeof OutboxTopic)[keyof typeof OutboxTopic];
@@ -24,10 +25,8 @@ export interface OutboxRecord {
 }
 
 /**
- * Enqueues asynchronous work in the same transaction as the business state change.
- *
- * The payload carries identifiers only. A worker reloads authoritative state from
- * PostgreSQL, so a stale or replayed message can never carry stale financial truth.
+ * Enqueued in the same transaction as the business state change. The payload carries
+ * identifiers only, so a stale or replayed message cannot carry stale financial truth.
  */
 export async function enqueueOutbox(
   executor: Executor,
@@ -45,10 +44,8 @@ export async function enqueueOutbox(
 }
 
 /**
- * Claims a batch of pending rows.
- *
- * FOR UPDATE SKIP LOCKED lets several dispatcher instances drain the outbox
- * concurrently without blocking each other or handing the same row to two of them.
+ * FOR UPDATE SKIP LOCKED lets several dispatchers drain the outbox concurrently without
+ * blocking each other or handing the same row to two of them.
  */
 export async function claimPendingOutbox(
   tx: Transaction,

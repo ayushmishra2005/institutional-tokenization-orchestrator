@@ -1,10 +1,7 @@
 /**
- * Signing port.
- *
- * There is deliberately no `sign(bytes)` operation. A caller may only ask for a
- * signature over a fully-specified EIP-1559 transaction whose destination and calldata
- * were constructed by this application from an allowlisted intent. Core application code
- * never touches key material; a future HSM/KMS/MPC adapter implements this same shape.
+ * There is deliberately no `sign(bytes)` operation. A caller may only ask for a signature
+ * over a fully-specified EIP-1559 transaction whose destination and calldata this
+ * application built from an allowlisted intent. Core code never touches key material.
  */
 
 export interface UnsignedTransactionRequest {

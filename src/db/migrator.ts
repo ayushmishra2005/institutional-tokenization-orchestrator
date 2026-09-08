@@ -23,8 +23,8 @@ function loadMigrations(): MigrationFile[] {
 }
 
 /**
- * Applies pending migrations inside a single transaction each, guarded by an advisory
- * lock so concurrently starting processes (api + worker + tests) cannot race.
+ * One transaction per migration, guarded by an advisory lock so concurrently starting
+ * processes (api, worker, tests) cannot race.
  */
 export async function runMigrations(pool: PgPool): Promise<string[]> {
   const client = await pool.connect();

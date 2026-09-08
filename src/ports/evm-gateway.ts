@@ -1,9 +1,6 @@
 /**
- * EVM access port.
- *
- * Domain and module code depends on these plain types only; viem lives entirely behind
- * the adapter. Operations are explicit and allowlisted - there is no generic
- * "call any contract with any calldata" entry point.
+ * Domain and module code depends on these plain types only; viem lives behind the adapter.
+ * Operations are allowlisted - there is no "call any contract with any calldata" entry point.
  */
 
 export interface ChainIdentity {

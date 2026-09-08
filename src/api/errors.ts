@@ -19,10 +19,8 @@ export interface NormalizedError {
 }
 
 /**
- * Converts any thrown value into a stable JSON error response.
- *
- * Unrecognised errors collapse to a generic INTERNAL_ERROR: stack traces and driver
- * messages are logged, never returned, so internals cannot leak to a caller.
+ * Unrecognised errors collapse to INTERNAL_ERROR: stack traces and driver messages are
+ * logged, never returned, so internals cannot leak to a caller.
  */
 export function normalizeError(
   error: unknown,

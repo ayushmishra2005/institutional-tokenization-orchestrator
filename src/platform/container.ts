@@ -6,7 +6,7 @@ import { getConfig, type AppConfig } from './config/index.js';
 import { createLogger, type Logger } from './logging/index.js';
 import { createMetrics, type Metrics } from './metrics/index.js';
 import { DevJwtAuthenticator } from './auth/jwt.js';
-import { createMintQueue, createRedisConnection, type MintJobData } from './queue/index.js';
+import { createOperationQueue, createRedisConnection, type OperationJobData } from './queue/index.js';
 import { ViemEvmGateway } from '../adapters/evm/viem-evm-gateway.js';
 import { LocalSignerProvider } from '../adapters/signer/local-signer-provider.js';
 import { MockComplianceProvider } from '../adapters/compliance/mock-compliance-provider.js';
@@ -18,7 +18,11 @@ import { WalletService } from '../modules/wallets/wallet-service.js';
 import { ComplianceService } from '../modules/compliance/compliance-service.js';
 import { IdempotencyService } from '../modules/idempotency/idempotency-service.js';
 import { MintService } from '../modules/operations/mint-service.js';
-import { MintExecutor } from '../modules/operations/mint-executor.js';
+import { OperationExecutor } from '../modules/operations/operation-executor.js';
+import { MintHandler } from '../modules/operations/handlers/mint-handler.js';
+import { AssetDeploymentHandler } from '../modules/operations/handlers/asset-deployment-handler.js';
+import { EligibilitySyncHandler } from '../modules/operations/handlers/eligibility-sync-handler.js';
+import { OperationType } from '../db/repositories/operation-repository.js';
 import { ApprovalService } from '../modules/approvals/approval-service.js';
 import { AuditService } from '../modules/audit/audit-service.js';
 import { OutboxDispatcher } from '../modules/outbox/outbox-dispatcher.js';
@@ -34,7 +38,7 @@ export interface Container {
   readonly db: Database;
   readonly dbHandle: DbHandle;
   readonly redis: IORedis;
-  readonly queue: Queue<MintJobData>;
+  readonly queue: Queue<OperationJobData>;
   readonly auth: DevJwtAuthenticator;
   readonly gateway: EvmGateway;
   readonly signer: SignerProvider;
@@ -45,7 +49,7 @@ export interface Container {
   readonly wallets: WalletService;
   readonly compliance: ComplianceService;
   readonly mints: MintService;
-  readonly mintExecutor: MintExecutor;
+  readonly operationExecutor: OperationExecutor;
   readonly approvals: ApprovalService;
   readonly audit: AuditService;
   readonly dispatcher: OutboxDispatcher;
@@ -81,7 +85,7 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
   if (options.migrate === true) await runMigrations(dbHandle.pool);
 
   const redis = createRedisConnection(config.REDIS_URL);
-  const queue = createMintQueue(redis, config.QUEUE_PREFIX);
+  const queue = createOperationQueue(redis, config.QUEUE_PREFIX);
 
   const auth = new DevJwtAuthenticator({
     secret: config.JWT_SECRET,
@@ -118,22 +122,9 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     logger,
   });
 
-  const assets = new AssetService({
-    db: dbHandle.db,
-    gateway,
-    signer,
-    chainWriter,
-    chainId: config.EVM_CHAIN_ID,
-    confirmation,
-  });
+  const assets = new AssetService({ db: dbHandle.db, chainId: config.EVM_CHAIN_ID });
   const wallets = new WalletService(dbHandle.db, config.EVM_CHAIN_ID);
-  const compliance = new ComplianceService({
-    db: dbHandle.db,
-    provider: complianceProvider,
-    gateway,
-    chainWriter,
-    confirmation,
-  });
+  const compliance = new ComplianceService({ db: dbHandle.db, provider: complianceProvider });
   const idempotency = new IdempotencyService(dbHandle.db);
   const mints = new MintService(dbHandle.db, idempotency, assets);
   const approvals = new ApprovalService(dbHandle.db, metrics);
@@ -145,17 +136,36 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     config.EVM_CHAIN_ID,
     logger,
   );
-  const mintExecutor = new MintExecutor({
+  // One engine, one handler per operation type. The engine owns the worker lease, the
+  // state machine and persist-before-broadcast; handlers own only what differs.
+  const operationExecutor = new OperationExecutor({
     db: dbHandle.db,
     gateway,
     chainWriter,
-    compliance,
-    reconciliation,
     confirmation,
-    chainId: config.EVM_CHAIN_ID,
-    mintDeadlineSeconds: config.MINT_DEADLINE_SECONDS,
     metrics,
     logger,
+    handlers: {
+      [OperationType.MINT]: new MintHandler({
+        db: dbHandle.db,
+        gateway,
+        compliance,
+        reconciliation,
+        chainId: config.EVM_CHAIN_ID,
+        mintDeadlineSeconds: config.MINT_DEADLINE_SECONDS,
+      }),
+      [OperationType.DEPLOY_ASSET]: new AssetDeploymentHandler({
+        db: dbHandle.db,
+        gateway,
+        signer,
+        reconciliation,
+      }),
+      [OperationType.SYNC_ELIGIBILITY]: new EligibilitySyncHandler({
+        db: dbHandle.db,
+        gateway,
+        reconciliation,
+      }),
+    },
   });
 
   const dispatcher = new OutboxDispatcher(dbHandle.db, queue, metrics, logger, {
@@ -167,7 +177,7 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     db: dbHandle.db,
     gateway,
     chainWriter,
-    executor: mintExecutor,
+    executor: operationExecutor,
     queue,
     metrics,
     logger,
@@ -192,7 +202,7 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     wallets,
     compliance,
     mints,
-    mintExecutor,
+    operationExecutor,
     approvals,
     audit,
     dispatcher,

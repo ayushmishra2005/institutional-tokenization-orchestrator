@@ -7,6 +7,7 @@ import {
   claimPendingOutbox,
   enqueueOutbox,
   markOutboxDispatched,
+  rescheduleOutbox,
   OutboxTopic,
 } from '../../src/db/repositories/outbox-repository.js';
 import { reserveNonce } from '../../src/db/repositories/transaction-repository.js';
@@ -33,7 +34,7 @@ describe('database-level concurrency guarantees', () => {
       const total = 30;
       for (let index = 0; index < total; index += 1) {
         await enqueueOutbox(db, {
-          topic: OutboxTopic.MINT_OPERATION_READY,
+          topic: OutboxTopic.OPERATION_READY,
           aggregateType: 'operation',
           aggregateId: randomUUID(),
           payload: { operationId: randomUUID() },
@@ -65,7 +66,7 @@ describe('database-level concurrency guarantees', () => {
       await db.delete(outbox);
 
       const row = await enqueueOutbox(db, {
-        topic: OutboxTopic.MINT_OPERATION_READY,
+        topic: OutboxTopic.OPERATION_READY,
         aggregateType: 'operation',
         aggregateId: randomUUID(),
         payload: { operationId: randomUUID() },
@@ -80,11 +81,61 @@ describe('database-level concurrency guarantees', () => {
       expect(claimed).toHaveLength(0);
     });
 
+    it('claims rows against the database clock even when the application clock lags', async () => {
+      const db = harness.container.db;
+      await db.delete(outbox);
+
+      const row = await enqueueOutbox(db, {
+        topic: OutboxTopic.OPERATION_READY,
+        aggregateType: 'operation',
+        aggregateId: randomUUID(),
+        payload: { operationId: randomUUID() },
+        correlationId: 'clock-skew',
+      });
+      await db
+        .update(outbox)
+        .set({ availableAt: sql`now()` })
+        .where(eq(outbox.id, row.id));
+
+      // Old failure mode: an application clock behind PostgreSQL never sees the row as due.
+      const laggingAppClock = new Date(Date.now() - 10 * 60_000);
+      const starved = await db.transaction((tx) =>
+        claimPendingOutbox(tx, { limit: 10, now: laggingAppClock }),
+      );
+      expect(starved).toHaveLength(0);
+
+      const claimed = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
+      expect(claimed.map((entry) => entry.id)).toEqual([row.id]);
+    });
+
+    it('schedules retry backoff from database time', async () => {
+      const db = harness.container.db;
+      await db.delete(outbox);
+      const row = await enqueueOutbox(db, {
+        topic: OutboxTopic.OPERATION_READY,
+        aggregateType: 'operation',
+        aggregateId: randomUUID(),
+        payload: { operationId: randomUUID() },
+        correlationId: 'backoff',
+      });
+
+      await rescheduleOutbox(db, { id: row.id, error: 'redis down', retryAfterMs: 30_000 });
+
+      const [after] = await db
+        .select({
+          secondsFromDbNow: sql<number>`extract(epoch from (${outbox.availableAt} - now()))`,
+        })
+        .from(outbox)
+        .where(eq(outbox.id, row.id));
+      expect(Number(after!.secondsFromDbNow)).toBeGreaterThan(25);
+      expect(Number(after!.secondsFromDbNow)).toBeLessThanOrEqual(30);
+    });
+
     it('increments the attempt counter on each claim', async () => {
       const db = harness.container.db;
       await db.delete(outbox);
       const row = await enqueueOutbox(db, {
-        topic: OutboxTopic.MINT_OPERATION_READY,
+        topic: OutboxTopic.OPERATION_READY,
         aggregateType: 'operation',
         aggregateId: randomUUID(),
         payload: { operationId: randomUUID() },

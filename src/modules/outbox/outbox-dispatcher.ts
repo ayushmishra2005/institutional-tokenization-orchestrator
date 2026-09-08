@@ -8,7 +8,7 @@ import {
   rescheduleOutbox,
   type OutboxRecord,
 } from '../../db/repositories/outbox-repository.js';
-import type { MintJobData } from '../../platform/queue/index.js';
+import type { OperationJobData } from '../../platform/queue/index.js';
 import type { Metrics } from '../../platform/metrics/index.js';
 import type { Logger } from '../../platform/logging/index.js';
 
@@ -33,7 +33,7 @@ export class OutboxDispatcher {
 
   constructor(
     private readonly db: Database,
-    private readonly queue: Queue<MintJobData>,
+    private readonly queue: Queue<OperationJobData>,
     private readonly metrics: Metrics,
     private readonly logger: Logger,
     private readonly options: OutboxDispatcherOptions,
@@ -99,7 +99,7 @@ export class OutboxDispatcher {
   }
 
   private async publish(row: OutboxRecord): Promise<void> {
-    if (row.topic !== OutboxTopic.MINT_OPERATION_READY) {
+    if (row.topic !== OutboxTopic.OPERATION_READY) {
       throw new Error(`unsupported outbox topic ${row.topic}`);
     }
     const payload = row.payload as { operationId?: string };
@@ -108,7 +108,7 @@ export class OutboxDispatcher {
     }
 
     await this.queue.add(
-      OutboxTopic.MINT_OPERATION_READY,
+      OutboxTopic.OPERATION_READY,
       {
         operationId: payload.operationId,
         outboxId: row.id,

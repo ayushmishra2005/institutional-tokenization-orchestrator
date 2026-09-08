@@ -27,11 +27,8 @@ export interface AuditEventRow {
 }
 
 /**
- * Appends an audit event.
- *
- * Callers must pass the same executor as the state mutation being audited, so evidence
- * and effect commit together or not at all. The table is append-only at the database
- * level; there is intentionally no update or delete here.
+ * Callers must pass the same executor as the state mutation being audited, so evidence and
+ * effect commit together or not at all. The table is append-only at the database level.
  */
 export async function recordAuditEvent(
   executor: Executor,
