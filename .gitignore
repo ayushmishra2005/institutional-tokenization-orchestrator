@@ -1,0 +1,17 @@
+node_modules/
+dist/
+
+# secrets / local environment
+.env
+.env.*
+!.env.example
+
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# tooling
+*.log
+.DS_Store
+coverage/

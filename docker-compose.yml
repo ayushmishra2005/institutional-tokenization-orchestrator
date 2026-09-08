@@ -1,0 +1,53 @@
+name: ito
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_USER: ito
+      POSTGRES_PASSWORD: ito
+      POSTGRES_DB: ito
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ito -d ito"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:v1.5.1
+    # Deterministic local chain: fixed mnemonic, fixed chain id, instant mining.
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8545"
+      - "--chain-id=31337"
+      - "--mnemonic=test test test test test test test test test test test junk"
+      - "--accounts=10"
+      - "--balance=10000"
+      - "--block-time=1"
+      - "--silent"
+    ports:
+      - "58545:8545"
+    healthcheck:
+      test:
+        - "CMD"
+        - "cast"
+        - "chain-id"
+        - "--rpc-url"
+        - "http://127.0.0.1:8545"
+      interval: 2s
+      timeout: 4s
+      retries: 40
