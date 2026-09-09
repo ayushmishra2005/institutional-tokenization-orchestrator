@@ -118,13 +118,18 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     gateway,
     signer,
     chainId: config.EVM_CHAIN_ID,
+    signerRequestTimeoutMs: config.SIGNER_REQUEST_TIMEOUT_MS,
     metrics,
     logger,
   });
 
   const assets = new AssetService({ db: dbHandle.db, chainId: config.EVM_CHAIN_ID });
   const wallets = new WalletService(dbHandle.db, config.EVM_CHAIN_ID);
-  const compliance = new ComplianceService({ db: dbHandle.db, provider: complianceProvider });
+  const compliance = new ComplianceService({
+    db: dbHandle.db,
+    provider: complianceProvider,
+    metrics,
+  });
   const idempotency = new IdempotencyService(dbHandle.db);
   const mints = new MintService(dbHandle.db, idempotency, assets);
   const approvals = new ApprovalService(dbHandle.db, metrics);

@@ -106,5 +106,9 @@ jobs:
           exit 1
 
       - run: pnpm db:migrate
-      - run: pnpm test:integration
+
+      # The demo runs first: suites that withhold a broadcast leave a reserved nonce
+      # unused on the shared chain, which would stall any later transaction on that lane.
       - run: pnpm demo
+      - run: pnpm demo:revocation
+      - run: pnpm test:integration

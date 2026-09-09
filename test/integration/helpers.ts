@@ -9,11 +9,13 @@ import {
   type DevUserSubject,
 } from '../../src/platform/bootstrap.js';
 import type { EvmGateway } from '../../src/ports/evm-gateway.js';
+import type { SignerProvider } from '../../src/ports/signer-provider.js';
 import type { ComplianceProvider } from '../../src/ports/compliance-provider.js';
 import { OperationState } from '../../src/domain/operation-state.js';
 
 const APPLICATION_TABLES = [
   'chain_observations',
+  'signer_requests',
   'transaction_attempts',
   'signer_nonces',
   'audit_events',
@@ -58,6 +60,7 @@ export async function createHarness(
   options: {
     gateway?: EvmGateway;
     complianceProvider?: ComplianceProvider;
+    signer?: SignerProvider;
     config?: Partial<AppConfig>;
   } = {},
 ): Promise<TestHarness> {
@@ -66,6 +69,7 @@ export async function createHarness(
     config: testConfig(options.config ?? {}),
     migrate: true,
     ...(options.gateway === undefined ? {} : { gateway: options.gateway }),
+    ...(options.signer === undefined ? {} : { signer: options.signer }),
     ...(options.complianceProvider === undefined
       ? {}
       : { complianceProvider: options.complianceProvider }),

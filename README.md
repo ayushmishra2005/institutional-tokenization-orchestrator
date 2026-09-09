@@ -44,7 +44,13 @@ The properties the design exists to guarantee:
   atomically. Queue payloads carry identifiers only; the worker reloads authoritative
   state from PostgreSQL.
 - **Signer boundary**: application code never touches a private key. It submits an
-  exact unsigned transaction and receives `SIGNED` or `REJECTED`.
+  exact unsigned transaction and receives `PENDING`, `SIGNED` or `REJECTED`. The signer
+  applies its own policy (chain, signer address, no value transfers, allowlisted function
+  selectors) and may refuse a request the workflow already approved.
+- **Asynchronous signing**: a signer may answer later. One signer request is recorded per
+  transaction attempt and keyed by the attempt, so a worker that restarts while a
+  signature is outstanding resumes the request the provider already holds instead of
+  creating a second signing intent for the same money.
 - **Verify-then-persist-then-broadcast**: the returned signed transaction is decoded,
   its signer recovered, and every field compared against the committed request before
   the exact bytes and hash are persisted. Only then is anything broadcast.
@@ -53,8 +59,14 @@ The properties the design exists to guarantee:
   new mint.
 - **Single-use operation references** on chain, so a duplicated delivery or a
   rebroadcast cannot mint twice.
-- **Fresh compliance re-check** immediately before execution; the approval snapshot is
-  not accepted as evidence at execution time.
+- **Fresh compliance re-check** immediately before execution *and* again immediately
+  before broadcast; the approval snapshot is not accepted as evidence at execution time.
+  A signature that arrives after compliance was revoked is kept as evidence and never
+  sent.
+- **Compliance decisions expire.** An approval carries a validity window, a worker sweep
+  retires lapsed approvals using database time, and revocation queues the on-chain
+  eligibility withdrawal asynchronously. A settled mint is never rewritten: the chain
+  cannot take it back, so only future eligibility changes.
 - **Reconciliation** of the receipt, the expected event, reference consumption,
   recipient balance and total supply before an operation is called `SUCCEEDED`.
 - **Append-only audit events**, written in the same transaction as the state change
@@ -109,6 +121,10 @@ pnpm demo
 `pnpm demo:clean` does the same from scratch: it tears the stack down **including its
 volumes**, brings it back up, migrates and runs the demo.
 
+`pnpm demo:revocation` runs the compliance side: it mints to an eligible wallet, revokes
+the approval, waits for the on-chain eligibility withdrawal, and shows the settled mint
+standing while a further mint is refused.
+
 `scripts/demo-mint.ts` drives the whole slice in-process — asset creation, wallet
 registration, compliance approval, mint request, both approvals, worker execution,
 confirmation and reconciliation — then prints the operation ID, transaction hash,
@@ -130,9 +146,12 @@ They cover the end-to-end mint, idempotency under 100 concurrent duplicate reque
 approval concurrency, database-level concurrency (outbox claiming against the database
 clock, nonce reservation, audit immutability), transport faults (ambiguous broadcast,
 exact-byte rebroadcast, on-chain revert, signer and compliance rejection), worker
-delivery semantics (duplicate delivery, lost queue message), and crash recovery
+delivery semantics (duplicate delivery, lost queue message), crash recovery
 (undispatched outbox, abandoned nonce reservation, receipt lookup lost mid-confirmation,
-full Redis flush).
+full Redis flush), asynchronous signing (pending signature resumed after a worker
+restart, provider request reuse, rejection, malformed signed bytes, a late signature
+withheld after revocation) and the compliance lifecycle (expiry sweep, re-screening,
+revocation, duplicate revocation, revocation racing an in-flight mint).
 
 CI runs the same commands: a quality job (typecheck, lint, unit tests, Foundry tests) and
 an integration job that brings up PostgreSQL and Redis as service containers, starts the
@@ -151,7 +170,8 @@ Authorization is enforced in the application services, not only in route handler
 | `POST` | `/v1/assets` | ISSUER, ADMIN | Queues the token deployment; `202` with a provisioning operation ID |
 | `GET` | `/v1/assets/{assetId}` | any | Asset and contract address |
 | `POST` | `/v1/wallets` | ISSUER, ADMIN | Registers an investor wallet; `201` |
-| `POST` | `/v1/wallets/{walletId}/compliance-decisions` | COMPLIANCE_OFFICER, ADMIN | Records the decision and queues the on-chain eligibility sync; `202` |
+| `POST` | `/v1/wallets/{walletId}/compliance-decisions` | COMPLIANCE_OFFICER, ADMIN | Records (or re-screens) the decision and queues the on-chain eligibility sync; `202` |
+| `POST` | `/v1/wallets/{walletId}/compliance-revocations` | COMPLIANCE_OFFICER, ADMIN | Withdraws a live approval and queues the on-chain withdrawal; `202` |
 | `POST` | `/v1/assets/{assetId}/mints` | ISSUER, ADMIN | Requires `Idempotency-Key`; returns `202` with an operation ID |
 | `POST` | `/v1/approval-requests/{requestId}/decisions` | APPROVER | `APPROVE` or `REJECT` |
 | `GET` | `/v1/operations/{operationId}` | any | State, transition history, transaction attempts, reconciliation findings |
@@ -189,12 +209,18 @@ traces:
 
 ## Limitations
 
-- One EVM chain, one local signer lane. No HSM, KMS, MPC or external custody.
+- One EVM chain, one local signer lane. No HSM, KMS, MPC or external custody. The
+  asynchronous signer adapter reproduces the timing and refusal semantics of an external
+  custody provider against the same local key; it is not an integration with one.
+- Compliance decisions carry a validity window and can be revoked, but the screening
+  itself is a mock adapter with no KYC, AML or sanctions data.
+- A withheld broadcast (signer refusal, revocation after signing) consumes its reserved
+  nonce without sending anything, which stalls that signer lane until an operator
+  intervenes. Closing the gap needs fee replacement, which is out of scope.
 - No fee replacement (RBF) or gas escalation: a stuck transaction stays stuck until an
   operator intervenes.
 - Reconciliation findings are persisted and exposed through the operations API; there is
   no resolution workflow or UI.
-- Compliance is a mock adapter with no KYC, AML or sanctions screening.
 - Finality on Anvil is approximated by a small confirmation depth; reorgs are not
   modelled.
 - Single-process deployment model. No deployment tooling, no cloud, no testnet or

@@ -15,11 +15,12 @@ import {
   findLatestAttemptForOperation,
   recordReceipt,
   updateAttemptStatus,
+  type TransactionAttemptRecord,
 } from '../../db/repositories/transaction-repository.js';
 import { recordAuditEvent } from '../../db/repositories/audit-repository.js';
 import { isTerminalOperationState, OperationState } from '../../domain/operation-state.js';
 import { systemActor } from '../../domain/roles.js';
-import { ErrorCode, isAppError } from '../../domain/errors.js';
+import { AppError, ErrorCode, isAppError } from '../../domain/errors.js';
 import type { OperationHandler, SettledOperation } from './operation-handler.js';
 import type { Metrics } from '../../platform/metrics/index.js';
 import type { Logger } from '../../platform/logging/index.js';
@@ -117,6 +118,13 @@ export class OperationExecutor {
     if (outcome.kind === 'FAILED') {
       return { kind: 'FAILED', code: outcome.code, message: outcome.message };
     }
+    if (outcome.kind === 'SIGNATURE_PENDING') {
+      log.info(
+        { transactionAttemptId: outcome.attemptId, providerRequestId: outcome.providerRequestId },
+        'awaiting signer decision; the recovery sweep will resume this attempt',
+      );
+      return { kind: 'PENDING', state: OperationState.SIGNING };
+    }
     if (outcome.kind === 'BROADCAST_UNKNOWN') {
       log.warn(
         { transactionAttemptId: outcome.attemptId, transactionHash: outcome.transactionHash },
@@ -127,6 +135,38 @@ export class OperationExecutor {
 
     return this.observeAndFinalize({
       operationId: operation.id,
+      attemptId: outcome.attemptId,
+      transactionHash: outcome.transactionHash as `0x${string}`,
+      log,
+    });
+  }
+
+  /**
+   * Resumes an attempt left in SIGNING by a worker that exited while the signer still
+   * held the request.
+   */
+  async resumePendingSignature(
+    operationId: string,
+    attempt: TransactionAttemptRecord,
+    log: Logger,
+  ): Promise<OperationExecutionResult> {
+    const outcome = await this.deps.chainWriter.resumeSignature(
+      attempt,
+      this.operationHooks(operationId),
+    );
+
+    if (outcome.kind === 'SIGNATURE_PENDING') {
+      return { kind: 'PENDING', state: OperationState.SIGNING };
+    }
+    if (outcome.kind === 'FAILED') {
+      return { kind: 'FAILED', code: outcome.code, message: outcome.message };
+    }
+    if (outcome.kind === 'BROADCAST_UNKNOWN') {
+      return { kind: 'PENDING', state: OperationState.BROADCAST_UNKNOWN };
+    }
+
+    return this.observeAndFinalize({
+      operationId,
       attemptId: outcome.attemptId,
       transactionHash: outcome.transactionHash as `0x${string}`,
       log,
@@ -154,6 +194,33 @@ export class OperationExecutor {
     };
 
     return {
+      assertBroadcastAllowed: async () => {
+        const operation = await findOperationById(this.deps.db, operationId);
+        if (operation === null) throw new Error(`operation ${operationId} disappeared`);
+        try {
+          if (operation.state === OperationState.CANCELLED) {
+            throw new AppError(
+              ErrorCode.OPERATION_CONFLICT,
+              'operation was cancelled before the signature was broadcast',
+            );
+          }
+          await this.handlerFor(operation).assertStillExecutable?.(operation);
+        } catch (error) {
+          await recordAuditEvent(this.deps.db, {
+            actor: this.actor,
+            action: 'operation.execution_withheld',
+            resourceType: 'operation',
+            resourceId: operation.id,
+            operationId: operation.id,
+            correlationId: operation.correlationId,
+            metadata: {
+              state: operation.state,
+              reason: isAppError(error) ? error.code : ErrorCode.INTERNAL_ERROR,
+            },
+          });
+          throw error;
+        }
+      },
       onPrepared: (tx: Transaction) => step(tx, OperationState.SIGNING),
       onSigned: (tx: Transaction) => step(tx, OperationState.SIGNED),
       onBroadcasting: (tx: Transaction) => step(tx, OperationState.BROADCASTING),

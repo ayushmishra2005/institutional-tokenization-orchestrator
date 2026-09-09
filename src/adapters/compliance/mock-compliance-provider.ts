@@ -25,6 +25,7 @@ export class MockComplianceProvider implements ComplianceProvider {
   private readonly validityMs: number;
   private readonly now: () => Date;
   private readonly forcedIneligible = new Set<string>();
+  private screenings = 0;
 
   constructor(options: MockComplianceOptions = {}) {
     this.validityMs = options.validityMs ?? 365 * 24 * 60 * 60 * 1000;
@@ -51,7 +52,13 @@ export class MockComplianceProvider implements ComplianceProvider {
     const digest = createHash('sha256')
       .update(`${this.name}:${request.subjectReference}:${request.walletAddress}:${request.chainId}`)
       .digest('hex');
-    return `mock-${digest.slice(0, 32)}`;
+    return `mock-${digest.slice(0, 24)}`;
+  }
+
+  /** Each screening is its own decision, so re-screening a subject yields a new reference. */
+  private screeningReference(request: ComplianceScreenRequest): string {
+    this.screenings += 1;
+    return `${this.reference(request)}-${this.screenings}`;
   }
 
   async screen(request: ComplianceScreenRequest): Promise<ComplianceDecisionResult> {
@@ -61,7 +68,7 @@ export class MockComplianceProvider implements ComplianceProvider {
     return {
       status: blocked ? ComplianceStatus.REJECTED : ComplianceStatus.APPROVED,
       provider: this.name,
-      providerReference: this.reference(request),
+      providerReference: this.screeningReference(request),
       validFrom: decidedAt,
       validUntil: new Date(decidedAt.getTime() + this.validityMs),
       decidedAt,

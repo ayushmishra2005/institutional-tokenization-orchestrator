@@ -230,8 +230,13 @@ describe('transaction flow under transport faults', () => {
 
     const broadcastsBefore = gateway.broadcasts.length;
     const signer = vi
-      .spyOn(harness.container.signer, 'sign')
-      .mockResolvedValue({ kind: 'REJECTED', reason: 'signer unavailable', code: 'SIGNER_DOWN' });
+      .spyOn(harness.container.signer, 'requestSignature')
+      .mockResolvedValue({
+        status: 'REJECTED',
+        providerRequestId: 'rejected-1',
+        reason: 'signer unavailable',
+        code: 'SIGNER_DOWN',
+      });
 
     await approveTwice(harness, mint.approvalRequestId);
     const state = await waitForState(

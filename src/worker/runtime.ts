@@ -3,6 +3,7 @@ import type { Worker } from 'bullmq';
 import type { Container } from '../platform/container.js';
 import { createOperationWorker, type OperationJobData } from '../platform/queue/index.js';
 import { countOperationsByState } from '../db/repositories/operation-repository.js';
+import { countPendingSignerRequests } from '../db/repositories/signer-request-repository.js';
 import { countOpenFindingsBySeverity } from '../db/repositories/transaction-repository.js';
 
 export interface WorkerReadiness {
@@ -65,7 +66,11 @@ export function startWorkerRuntime(container: Container): WorkerRuntime {
     void (async () => {
       try {
         const summary = await container.recovery.sweep();
+        const expired = await container.compliance.expireLapsedApprovals();
+        if (expired > 0) logger.warn({ expired }, 'retired lapsed compliance approvals');
+
         const openFindings = await countOpenFindingsBySeverity(container.db);
+        container.metrics.signerPending.set(await countPendingSignerRequests(container.db));
         if (summary.requeued + summary.rebroadcast + summary.resolved + summary.failed > 0) {
           logger.warn({ summary }, 'recovery sweep took action');
         }

@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import {
+  approveTwice,
   createHarness,
+  getOperationState,
   requestMint,
   seedAssetAndWallet,
   type SeededAsset,
@@ -187,6 +189,16 @@ describe('two-person approval workflow', () => {
     const later = await decide(mint.approvalRequestId, 'dev-approver-2');
     expect(later.statusCode).toBe(409);
     expect(later.json<{ error: { code: string } }>().error.code).toBe('APPROVAL_REQUEST_CLOSED');
+  });
+
+  it('cannot cancel an operation once it is approved and queued for execution', async () => {
+    const mint = await requestMint(harness, seed);
+    await approveTwice(harness, mint.approvalRequestId);
+
+    const late = await decide(mint.approvalRequestId, 'dev-approver-1', 'REJECT');
+    expect(late.statusCode).toBe(409);
+    expect(late.json<{ error: { code: string } }>().error.code).toBe('APPROVAL_REQUEST_CLOSED');
+    expect(await getOperationState(harness, mint.operationId)).toBe(OperationState.READY);
   });
 
   it('does not both approve and cancel when a rejection races the final approval', async () => {

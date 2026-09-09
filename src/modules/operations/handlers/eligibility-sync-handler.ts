@@ -13,7 +13,7 @@ import { findWalletById } from '../../../db/repositories/wallet-repository.js';
 import type { OperationRecord } from '../../../db/repositories/operation-repository.js';
 import type { AttemptPurpose } from '../../../db/repositories/transaction-repository.js';
 import { AppError, ErrorCode } from '../../../domain/errors.js';
-import { hashEligibilitySyncIntent } from '../administrative-intent.js';
+import { eligibleUntilFor, hashEligibilitySyncIntent } from '../administrative-intent.js';
 import type {
   OperationHandler,
   PreparedChainWrite,
@@ -92,15 +92,24 @@ export class EligibilitySyncHandler implements OperationHandler {
         'eligibility sync is missing its asset, wallet or compliance decision',
       );
     }
-    if (decision.status !== 'APPROVED' || decision.supersededAt !== null) {
+    // An approval must still be live to grant eligibility on chain. A revoked or expired
+    // decision is the opposite instruction and stays executable: it withdraws eligibility.
+    if (decision.status === 'APPROVED' && decision.supersededAt !== null) {
       throw new AppError(
         ErrorCode.COMPLIANCE_NOT_ELIGIBLE,
-        'compliance decision is no longer live; refusing to write eligibility on chain',
+        'compliance decision was superseded; refusing to write eligibility on chain',
         { details: { decisionId: decision.id, status: decision.status } },
       );
     }
+    if (decision.status === 'REJECTED') {
+      throw new AppError(
+        ErrorCode.COMPLIANCE_NOT_ELIGIBLE,
+        'rejected decisions never produce an eligibility write',
+        { details: { decisionId: decision.id } },
+      );
+    }
 
-    const eligibleUntil = BigInt(Math.floor(decision.validUntil.getTime() / 1000));
+    const eligibleUntil = eligibleUntilFor(decision);
     const intentHash = hashEligibilitySyncIntent({
       assetId: asset.id,
       chainId: asset.chainId,

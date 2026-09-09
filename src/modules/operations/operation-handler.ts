@@ -31,6 +31,13 @@ export interface OperationHandler {
    */
   prepare(operation: OperationRecord, log: Logger): Promise<PreparedChainWrite>;
 
+  /**
+   * Re-checks, immediately before broadcast, that the operation may still execute. Runs
+   * again for a signature that arrived late, when the world may have moved on since
+   * `prepare`. Throws an AppError to withhold the signed transaction.
+   */
+  assertStillExecutable?(operation: OperationRecord): Promise<void>;
+
   /** Compares the receipt against expectations, persisting each check as an observation. */
   reconcile(settled: SettledOperation): Promise<ReconciliationReport>;
 

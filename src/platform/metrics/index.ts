@@ -18,7 +18,10 @@ export class Metrics {
   readonly transactionConfirmations: Counter<'outcome'>;
   readonly reconciliationFindings: Counter<'type' | 'outcome'>;
   readonly openReconciliationFindings: Gauge<'severity'>;
+  readonly signerRequests: Counter<'provider' | 'outcome'>;
+  readonly signerPending: Gauge<string>;
   readonly signerFailures: Counter<'reason'>;
+  readonly complianceChecks: Counter<'outcome'>;
 
   readonly outboxBacklog: Gauge<'status'>;
   readonly outboxDispatched: Counter<'topic' | 'result'>;
@@ -101,6 +104,26 @@ export class Metrics {
       name: 'ito_reconciliation_open_findings',
       help: 'Unresolved reconciliation findings by severity',
       labelNames: ['severity'] as const,
+      registers: [this.registry],
+    });
+
+    this.signerRequests = new Counter({
+      name: 'ito_signer_requests_total',
+      help: 'Signature requests submitted to a signer, by immediate outcome',
+      labelNames: ['provider', 'outcome'] as const,
+      registers: [this.registry],
+    });
+
+    this.signerPending = new Gauge({
+      name: 'ito_signer_pending',
+      help: 'Signature requests awaiting a signer decision',
+      registers: [this.registry],
+    });
+
+    this.complianceChecks = new Counter({
+      name: 'ito_compliance_checks_total',
+      help: 'Compliance evaluations by outcome',
+      labelNames: ['outcome'] as const,
       registers: [this.registry],
     });
 

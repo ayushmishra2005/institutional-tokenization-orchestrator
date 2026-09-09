@@ -45,6 +45,11 @@ const complianceDecisionSchema = z.object({
   subjectReference: z.string().min(1).max(128).optional(),
 });
 
+const complianceRevocationSchema = z.object({
+  assetId: z.string().uuid().optional(),
+  reason: z.string().min(1).max(500),
+});
+
 const createMintSchema = z.object({
   walletId: z.string().uuid(),
   amount: amountSchema,
@@ -209,6 +214,28 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
         validUntil: decision.validUntil.toISOString(),
         decidedAt: decision.decidedAt.toISOString(),
         chainSyncStatus: decision.chainSyncStatus,
+        eligibilityOperationId: operationId,
+      });
+    },
+  );
+
+  app.post(
+    '/v1/wallets/:walletId/compliance-revocations',
+    { onRequest: authenticate },
+    async (request, reply) => {
+      const { walletId } = z.object({ walletId: z.string().uuid() }).parse(request.params);
+      const body = complianceRevocationSchema.parse(request.body ?? {});
+      const { decision, operationId } = await container.compliance.revokeDecision(request.ctx, {
+        walletId,
+        ...body,
+      });
+      return reply.status(operationId === null ? 200 : 202).send({
+        id: decision.id,
+        walletId: decision.walletId,
+        assetId: decision.assetId,
+        status: decision.status,
+        revokedAt: decision.revokedAt?.toISOString() ?? null,
+        revocationReason: decision.revocationReason,
         eligibilityOperationId: operationId,
       });
     },

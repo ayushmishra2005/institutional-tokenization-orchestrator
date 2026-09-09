@@ -1,6 +1,10 @@
 import type { Database, Transaction } from '../../db/pool.js';
 import type { EvmGateway, EncodedCall } from '../../ports/evm-gateway.js';
-import type { SignerProvider, UnsignedTransactionRequest } from '../../ports/signer-provider.js';
+import type {
+  SignerProvider,
+  SignerRequestState,
+  UnsignedTransactionRequest,
+} from '../../ports/signer-provider.js';
 import { verifySignedTransaction } from '../../adapters/evm/signed-transaction-verifier.js';
 import {
   AttemptStatus,
@@ -11,7 +15,14 @@ import {
   type AttemptPurpose,
   type TransactionAttemptRecord,
 } from '../../db/repositories/transaction-repository.js';
-import { AppError, ErrorCode } from '../../domain/errors.js';
+import {
+  findSignerRequestForAttempt,
+  markSignerRequestRefused,
+  markSignerRequestSigned,
+  recordSignerRequest,
+  touchSignerRequest,
+} from '../../db/repositories/signer-request-repository.js';
+import { AppError, ErrorCode, isAppError } from '../../domain/errors.js';
 import { canonicalHash } from '../../domain/canonical.js';
 import type { Metrics } from '../../platform/metrics/index.js';
 import type { Logger } from '../../platform/logging/index.js';
@@ -25,6 +36,11 @@ export interface ChainWriteHooks {
   onPrepared?(tx: Transaction, attempt: TransactionAttemptRecord): Promise<void>;
   /** Runs in the transaction that durably stores the signed bytes. */
   onSigned?(tx: Transaction, attempt: TransactionAttemptRecord): Promise<void>;
+  /**
+   * Last chance to stop a signed transaction that must no longer happen. Throwing here
+   * keeps the signed bytes as evidence and leaves the chain untouched.
+   */
+  assertBroadcastAllowed?(): Promise<void>;
   onBroadcasting?(tx: Transaction, attempt: TransactionAttemptRecord): Promise<void>;
   onSubmitted?(tx: Transaction, attempt: TransactionAttemptRecord, hash: string): Promise<void>;
   onBroadcastUnknown?(
@@ -53,6 +69,12 @@ export interface ChainWriteIntent {
 export type ChainWriteOutcome =
   | { readonly kind: 'SUBMITTED'; readonly attemptId: string; readonly transactionHash: string }
   | {
+      /** The signer has the request but has not decided; nothing has been broadcast. */
+      readonly kind: 'SIGNATURE_PENDING';
+      readonly attemptId: string;
+      readonly providerRequestId: string;
+    }
+  | {
       readonly kind: 'BROADCAST_UNKNOWN';
       readonly attemptId: string;
       readonly transactionHash: string;
@@ -70,6 +92,7 @@ export interface ChainWriterDeps {
   readonly gateway: EvmGateway;
   readonly signer: SignerProvider;
   readonly chainId: number;
+  readonly signerRequestTimeoutMs: number;
   readonly metrics: Metrics;
   readonly logger: Logger;
 }
@@ -157,7 +180,7 @@ export class ChainWriter {
       maxPriorityFeePerGas: BigInt(attempt.maxPriorityFeePerGas),
     };
 
-    const signed = await signer.sign(request, {
+    const state = await signer.requestSignature(request, {
       purpose: intent.purpose,
       ...(intent.operationId === null ? {} : { operationId: intent.operationId }),
       ...(intent.assetId === null ? {} : { assetId: intent.assetId }),
@@ -165,17 +188,116 @@ export class ChainWriter {
       evidence: intent.evidence,
     });
 
-    if (signed.kind === 'REJECTED') {
-      this.deps.metrics.signerFailures.inc({ reason: signed.code });
+    const signerRequest = await recordSignerRequest(db, {
+      transactionAttemptId: attempt.id,
+      operationId: intent.operationId,
+      provider: signer.name,
+      providerRequestId: state.providerRequestId,
+      status: state.status,
+      requestFingerprint: attempt.requestHash,
+    });
+    this.deps.metrics.signerRequests.inc({ provider: signer.name, outcome: state.status });
+
+    if (state.status === 'PENDING') {
+      logger.info(
+        { transactionAttemptId: attempt.id, providerRequestId: state.providerRequestId },
+        'signature request pending with the signer',
+      );
+      return {
+        kind: 'SIGNATURE_PENDING',
+        attemptId: attempt.id,
+        providerRequestId: state.providerRequestId,
+      };
+    }
+
+    return this.settleSignature(attempt, request, state, signerRequest.id, hooks);
+  }
+
+  /**
+   * Resumes an attempt whose signature was still outstanding, using the provider request
+   * the previous worker created. Never submits a new request: the provider may already be
+   * holding an authorised signature for these exact bytes.
+   */
+  async resumeSignature(
+    attempt: TransactionAttemptRecord,
+    hooks: ChainWriteHooks = {},
+  ): Promise<ChainWriteOutcome> {
+    const { db, signer } = this.deps;
+    const signerRequest = await findSignerRequestForAttempt(db, attempt.id);
+    if (signerRequest === null || signerRequest.status !== 'PENDING') {
+      return {
+        kind: 'FAILED',
+        attemptId: attempt.id,
+        code: ErrorCode.SIGNER_REJECTED,
+        message: 'no outstanding signature request for this attempt',
+      };
+    }
+
+    const state = await signer.fetchSignature(signerRequest.providerRequestId);
+    await touchSignerRequest(db, signerRequest.id);
+
+    if (state.status === 'PENDING') {
+      const waitedMs = Date.now() - signerRequest.requestedAt.getTime();
+      if (waitedMs < this.deps.signerRequestTimeoutMs) {
+        return {
+          kind: 'SIGNATURE_PENDING',
+          attemptId: attempt.id,
+          providerRequestId: signerRequest.providerRequestId,
+        };
+      }
+
+      await markSignerRequestRefused(db, {
+        id: signerRequest.id,
+        status: 'EXPIRED',
+        rejectionCode: 'SIGNER_REQUEST_TIMEOUT',
+      });
+      this.deps.metrics.signerFailures.inc({ reason: 'SIGNER_REQUEST_TIMEOUT' });
       await this.failAttempt(attempt, hooks, {
         code: ErrorCode.SIGNER_REJECTED,
-        message: `${signed.code}: ${signed.reason}`,
+        message: 'signer did not decide within the permitted window',
       });
       return {
         kind: 'FAILED',
         attemptId: attempt.id,
         code: ErrorCode.SIGNER_REJECTED,
-        message: signed.reason,
+        message: 'signer request expired',
+      };
+    }
+
+    return this.settleSignature(
+      attempt,
+      unsignedRequestFrom(attempt),
+      state,
+      signerRequest.id,
+      hooks,
+    );
+  }
+
+  private async settleSignature(
+    attempt: TransactionAttemptRecord,
+    request: UnsignedTransactionRequest,
+    state: Extract<SignerRequestState, { status: 'SIGNED' | 'REJECTED' }>,
+    signerRequestId: string,
+    hooks: ChainWriteHooks,
+  ): Promise<ChainWriteOutcome> {
+    const { db, logger } = this.deps;
+
+    if (state.status === 'REJECTED') {
+      await markSignerRequestRefused(db, {
+        id: signerRequestId,
+        status: 'REJECTED',
+        rejectionCode: state.code,
+      });
+      this.deps.metrics.signerFailures.inc({ reason: state.code });
+      await this.failAttempt(attempt, hooks, {
+        code: ErrorCode.SIGNER_REJECTED,
+        message: `${state.code}: ${state.reason}`,
+      });
+      return {
+        kind: 'FAILED',
+        attemptId: attempt.id,
+        code: ErrorCode.SIGNER_REJECTED,
+        message: state.reason,
       };
     }
 
@@ -183,10 +305,10 @@ export class ChainWriter {
     let verified;
     try {
       verified = await verifySignedTransaction(
-        signed.signedTransaction,
+        state.signedTransaction,
         request,
-        signerAddress,
-        signed.transactionHash,
+        request.from,
+        state.transactionHash,
       );
     } catch (error) {
       this.deps.metrics.signerFailures.inc({ reason: ErrorCode.SIGNED_TRANSACTION_MISMATCH });
@@ -202,11 +324,25 @@ export class ChainWriter {
     await db.transaction(async (tx) => {
       await persistSignedAttempt(tx, {
         attemptId: attempt.id,
-        signedRawTransaction: signed.signedTransaction,
+        signedRawTransaction: state.signedTransaction,
         transactionHash: verified.transactionHash,
       });
+      await markSignerRequestSigned(tx, signerRequestId);
       await hooks.onSigned?.(tx, attempt);
     });
+
+    try {
+      await hooks.assertBroadcastAllowed?.();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'broadcast refused';
+      const code = isAppError(error) ? error.code : ErrorCode.INTERNAL_ERROR;
+      logger.warn(
+        { transactionAttemptId: attempt.id, code },
+        'signed transaction withheld; the operation may no longer execute',
+      );
+      await this.failAttempt(attempt, hooks, { code, message });
+      return { kind: 'FAILED', attemptId: attempt.id, code, message };
+    }
 
     // Committing BROADCASTING before the send is what makes a crash here recoverable
     // rather than indistinguishable from "never attempted".
@@ -224,7 +360,7 @@ export class ChainWriter {
       'broadcasting signed transaction',
     );
 
-    return this.broadcast(attempt, signed.signedTransaction, verified.transactionHash, hooks);
+    return this.broadcast(attempt, state.signedTransaction, verified.transactionHash, hooks);
   }
 
   /**
@@ -319,6 +455,22 @@ export class ChainWriter {
       await hooks.onFailed?.(tx, attempt, failure);
     });
   }
+}
+
+/** Rebuilds the exact request a persisted attempt represents, for signature verification. */
+function unsignedRequestFrom(attempt: TransactionAttemptRecord): UnsignedTransactionRequest {
+  return {
+    attemptId: attempt.id,
+    chainId: attempt.chainId,
+    from: attempt.fromAddress as `0x${string}`,
+    to: attempt.toAddress as `0x${string}` | null,
+    nonce: attempt.nonce,
+    value: 0n,
+    data: attempt.data as `0x${string}`,
+    gasLimit: BigInt(attempt.gasLimit),
+    maxFeePerGas: BigInt(attempt.maxFeePerGas),
+    maxPriorityFeePerGas: BigInt(attempt.maxPriorityFeePerGas),
+  };
 }
 
 export type BroadcastErrorClass =

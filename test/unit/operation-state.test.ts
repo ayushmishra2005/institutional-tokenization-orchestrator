@@ -127,6 +127,25 @@ describe('operation state machine', () => {
     }
   });
 
+  it('permits cancellation only before a signature exists', () => {
+    for (const state of [OperationState.PENDING_APPROVAL, OperationState.READY]) {
+      expect(canTransitionOperation(state, OperationState.CANCELLED), state).toBe(true);
+    }
+
+    // Once bytes are signed the transaction may reach the chain at any moment, and no
+    // application state change can retract it.
+    for (const state of [
+      OperationState.SIGNED,
+      OperationState.BROADCASTING,
+      OperationState.BROADCAST_UNKNOWN,
+      OperationState.SUBMITTED,
+      OperationState.INCLUDED,
+      OperationState.SUCCEEDED,
+    ]) {
+      expect(canTransitionOperation(state, OperationState.CANCELLED), state).toBe(false);
+    }
+  });
+
   it('has no self-transitions', () => {
     for (const state of OPERATION_STATES) {
       expect(canTransitionOperation(state, state), state).toBe(false);

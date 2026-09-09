@@ -14,6 +14,7 @@ import {
   findLatestAttemptForOperation,
   updateAttemptStatus,
 } from '../../db/repositories/transaction-repository.js';
+import { findSignerRequestForAttempt } from '../../db/repositories/signer-request-repository.js';
 import { recordAuditEvent } from '../../db/repositories/audit-repository.js';
 import { OperationState } from '../../domain/operation-state.js';
 import { systemActor } from '../../domain/roles.js';
@@ -90,8 +91,15 @@ export class RecoveryService {
         await this.requeue(operation);
         return 'REQUEUED';
 
+      case OperationState.SIGNING: {
+        // An outstanding request means the signer may be about to authorise these exact
+        // bytes; the previous worker's request is resumed rather than replaced.
+        const resumed = await this.resumePendingSignature(operation);
+        if (resumed !== null) return resumed;
+        return (await this.abandonUnbroadcast(operation)) ? 'FAILED' : 'NOOP';
+      }
+
       case OperationState.PREPARING:
-      case OperationState.SIGNING:
         // Nothing was ever broadcast in these states - signed bytes are persisted
         // before BROADCASTING - so failing here cannot strand value on chain.
         return (await this.abandonUnbroadcast(operation)) ? 'FAILED' : 'NOOP';
@@ -117,6 +125,28 @@ export class RecoveryService {
       { jobId: `recovery-${operation.id}-${Date.now()}` },
     );
     this.deps.logger.warn({ operationId: operation.id }, 'requeued lost mint job from PostgreSQL');
+  }
+
+  private async resumePendingSignature(
+    operation: OperationRecord,
+  ): Promise<'RESOLVED' | 'FAILED' | 'NOOP' | null> {
+    const attempt = await findLatestAttemptForOperation(this.deps.db, operation.id);
+    if (attempt === null || attempt.signedRawTransaction !== null) return null;
+
+    const signerRequest = await findSignerRequestForAttempt(this.deps.db, attempt.id);
+    if (signerRequest === null || signerRequest.status !== 'PENDING') return null;
+
+    const log = this.deps.logger.child({
+      operationId: operation.id,
+      transactionAttemptId: attempt.id,
+      providerRequestId: signerRequest.providerRequestId,
+      recoveryAction: 'RESUME_SIGNATURE',
+    });
+    const result = await this.deps.executor.resumePendingSignature(operation.id, attempt, log);
+
+    if (result.kind === 'PENDING' && result.state === OperationState.SIGNING) return 'NOOP';
+    if (result.kind === 'FAILED') return 'FAILED';
+    return 'RESOLVED';
   }
 
   private async abandonUnbroadcast(operation: OperationRecord): Promise<boolean> {

@@ -29,22 +29,30 @@ export interface SigningPolicyContext {
   readonly evidence: Readonly<Record<string, unknown>>;
 }
 
-export const SignerResultKind = {
+export const SignerRequestStatus = {
+  PENDING: 'PENDING',
   SIGNED: 'SIGNED',
   REJECTED: 'REJECTED',
 } as const;
 
-export type SignerResultKind = (typeof SignerResultKind)[keyof typeof SignerResultKind];
+export type SignerRequestStatus = (typeof SignerRequestStatus)[keyof typeof SignerRequestStatus];
 
-export type SignerResult =
+/**
+ * A signature request may outlive the call that submitted it: institutional signers queue
+ * requests behind their own policy and human review.
+ */
+export type SignerRequestState =
+  | { readonly status: 'PENDING'; readonly providerRequestId: string }
   | {
-      readonly kind: 'SIGNED';
+      readonly status: 'SIGNED';
+      readonly providerRequestId: string;
       readonly signerAddress: `0x${string}`;
       readonly signedTransaction: `0x${string}`;
       readonly transactionHash: `0x${string}`;
     }
   | {
-      readonly kind: 'REJECTED';
+      readonly status: 'REJECTED';
+      readonly providerRequestId: string;
       readonly reason: string;
       readonly code: string;
     };
@@ -55,8 +63,16 @@ export interface SignerProvider {
   /** Address this signer will sign as. Callers verify the returned signature against it. */
   getSignerAddress(): Promise<`0x${string}`>;
 
-  sign(
+  /**
+   * Submits the request. Must be idempotent on `request.attemptId`: a retry after a lost
+   * response has to resolve to the same provider request rather than a second signing
+   * intent for the same money.
+   */
+  requestSignature(
     request: UnsignedTransactionRequest,
     context: SigningPolicyContext,
-  ): Promise<SignerResult>;
+  ): Promise<SignerRequestState>;
+
+  /** Current state of a request submitted earlier, possibly by a since-crashed worker. */
+  fetchSignature(providerRequestId: string): Promise<SignerRequestState>;
 }

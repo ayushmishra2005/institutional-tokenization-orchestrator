@@ -24,6 +24,16 @@ export function hashAssetDeploymentIntent(asset: {
   });
 }
 
+/**
+ * Chain-side effect of a compliance decision. Anything other than a live approval means
+ * the wallet must not hold or receive the token, which the contract expresses as a zero
+ * eligibility deadline.
+ */
+export function eligibleUntilFor(decision: { status: string; validUntil: Date }): bigint {
+  if (decision.status !== 'APPROVED') return 0n;
+  return BigInt(Math.floor(decision.validUntil.getTime() / 1000));
+}
+
 export function hashEligibilitySyncIntent(input: {
   assetId: string;
   chainId: number;

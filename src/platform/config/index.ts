@@ -27,6 +27,7 @@ const envSchema = z.object({
   EVM_CONFIRMATIONS: z.coerce.number().int().min(1).default(2),
   EVM_RECEIPT_TIMEOUT_MS: z.coerce.number().int().min(1000).default(60_000),
   /** Seconds added to `block.timestamp` when building a mint deadline. */
+  SIGNER_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).default(300_000),
   MINT_DEADLINE_SECONDS: z.coerce.number().int().min(30).default(900),
 
   JWT_SECRET: z.string().min(16, 'JWT secret must be at least 16 characters'),

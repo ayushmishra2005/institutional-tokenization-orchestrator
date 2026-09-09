@@ -103,6 +103,8 @@ export const complianceDecisions = pgTable(
     chainSyncStatus: text('chain_sync_status').notNull().default('PENDING'),
     chainSyncTxHash: text('chain_sync_tx_hash'),
     supersededAt: timestamp('superseded_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    revocationReason: text('revocation_reason'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index('compliance_decisions_wallet_idx').on(table.walletId, table.decidedAt)],
@@ -325,4 +327,21 @@ export const chainObservations = pgTable('chain_observations', {
   detail: text('detail'),
   observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
   resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+});
+
+export const signerRequests = pgTable('signer_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  transactionAttemptId: uuid('transaction_attempt_id')
+    .notNull()
+    .references(() => transactionAttempts.id),
+  operationId: uuid('operation_id').references(() => operations.id),
+  provider: text('provider').notNull(),
+  providerRequestId: text('provider_request_id').notNull(),
+  status: text('status').notNull(),
+  requestFingerprint: text('request_fingerprint').notNull(),
+  requestedAt: timestamp('requested_at', { withTimezone: true }).notNull().defaultNow(),
+  lastCheckedAt: timestamp('last_checked_at', { withTimezone: true }),
+  signedAt: timestamp('signed_at', { withTimezone: true }),
+  rejectedAt: timestamp('rejected_at', { withTimezone: true }),
+  rejectionCode: text('rejection_code'),
 });

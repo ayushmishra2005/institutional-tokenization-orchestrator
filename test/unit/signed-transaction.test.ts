@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { keccak256, parseTransaction, serializeTransaction } from 'viem';
+import { keccak256, parseTransaction, serializeTransaction, toFunctionSelector } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { LocalSignerProvider } from '../../src/adapters/signer/local-signer-provider.js';
 import { verifySignedTransaction } from '../../src/adapters/evm/signed-transaction-verifier.js';
@@ -16,6 +16,11 @@ const OTHER_PRIVATE_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f
 const CHAIN_ID = 31337;
 
 const account = privateKeyToAccount(PRIVATE_KEY);
+
+// setEligibility(account, eligibleUntil) with zeroed arguments: the signer allowlists by
+// selector, so the arguments are irrelevant to these tests.
+const ELIGIBILITY_CALLDATA =
+  `${toFunctionSelector('function setEligibility(address,uint64)')}${'00'.repeat(64)}` as const;
 
 function makeSigner(): LocalSignerProvider {
   return new LocalSignerProvider({
@@ -35,7 +40,7 @@ function makeRequest(
     to: '0x5fbdb2315678afecb367f032d93f642f64180aa3',
     nonce: 7,
     value: 0n,
-    data: '0xdeadbeef',
+    data: ELIGIBILITY_CALLDATA,
     gasLimit: 120_000n,
     maxFeePerGas: 2_000_000_000n,
     maxPriorityFeePerGas: 1_000_000_000n,
@@ -72,45 +77,59 @@ describe('local signer provider', () => {
   });
 
   it('signs a well-formed request', async () => {
-    const result = await makeSigner().sign(makeRequest(), context);
-    expect(result.kind).toBe('SIGNED');
+    const result = await makeSigner().requestSignature(makeRequest(), context);
+    expect(result.status).toBe('SIGNED');
   });
 
   it('rejects a request for another chain', async () => {
-    const result = await makeSigner().sign(makeRequest({ chainId: 1 }), context);
-    expect(result).toMatchObject({ kind: 'REJECTED', code: 'CHAIN_ID_NOT_PERMITTED' });
+    const result = await makeSigner().requestSignature(makeRequest({ chainId: 1 }), context);
+    expect(result).toMatchObject({ status: 'REJECTED', code: 'CHAIN_ID_NOT_PERMITTED' });
   });
 
   it('rejects a request for an address it does not hold', async () => {
-    const result = await makeSigner().sign(
+    const result = await makeSigner().requestSignature(
       makeRequest({ from: '0x0000000000000000000000000000000000000009' }),
       context,
     );
-    expect(result).toMatchObject({ kind: 'REJECTED', code: 'SIGNER_ADDRESS_MISMATCH' });
+    expect(result).toMatchObject({ status: 'REJECTED', code: 'SIGNER_ADDRESS_MISMATCH' });
   });
 
   it('never authorises a native value transfer', async () => {
-    const result = await makeSigner().sign(makeRequest({ value: 1n }), context);
-    expect(result).toMatchObject({ kind: 'REJECTED', code: 'VALUE_TRANSFER_NOT_PERMITTED' });
+    const result = await makeSigner().requestSignature(makeRequest({ value: 1n }), context);
+    expect(result).toMatchObject({ status: 'REJECTED', code: 'VALUE_TRANSFER_NOT_PERMITTED' });
+  });
+
+  it('refuses calldata that is not an allowlisted token function', async () => {
+    const result = await makeSigner().requestSignature(makeRequest({ data: '0xdeadbeef' }), context);
+    expect(result).toMatchObject({ status: 'REJECTED', code: 'FUNCTION_NOT_PERMITTED' });
+  });
+
+  it('resolves a resubmitted attempt to the same provider request', async () => {
+    const signer = makeSigner();
+    const request = makeRequest();
+    const first = await signer.requestSignature(request, context);
+    const retry = await signer.requestSignature(request, context);
+    expect(retry.providerRequestId).toBe(first.providerRequestId);
+    expect(retry).toStrictEqual(first);
   });
 
   it('only permits contract creation for token deployment', async () => {
-    const result = await makeSigner().sign(makeRequest({ to: null }), context);
-    expect(result).toMatchObject({ kind: 'REJECTED', code: 'CONTRACT_CREATION_NOT_PERMITTED' });
+    const result = await makeSigner().requestSignature(makeRequest({ to: null }), context);
+    expect(result).toMatchObject({ status: 'REJECTED', code: 'CONTRACT_CREATION_NOT_PERMITTED' });
 
-    const deploy = await makeSigner().sign(makeRequest({ to: null }), {
+    const deploy = await makeSigner().requestSignature(makeRequest({ to: null }), {
       ...context,
       purpose: 'DEPLOY_TOKEN',
     });
-    expect(deploy.kind).toBe('SIGNED');
+    expect(deploy.status).toBe('SIGNED');
   });
 });
 
 describe('signed transaction verification', () => {
   it('accepts bytes that match the committed request exactly', async () => {
     const request = makeRequest();
-    const signed = await makeSigner().sign(request, context);
-    if (signed.kind !== 'SIGNED') expect.unreachable('signer should have signed');
+    const signed = await makeSigner().requestSignature(request, context);
+    if (signed.status !== 'SIGNED') expect.unreachable('signer should have signed');
 
     const verified = await verifySignedTransaction(
       signed.signedTransaction,
@@ -129,11 +148,11 @@ describe('signed transaction verification', () => {
       expectedAddress: privateKeyToAccount(OTHER_PRIVATE_KEY).address.toLowerCase() as `0x${string}`,
       chainId: CHAIN_ID,
     });
-    const signed = await rogue.sign(
+    const signed = await rogue.requestSignature(
       { ...request, from: privateKeyToAccount(OTHER_PRIVATE_KEY).address },
       context,
     );
-    if (signed.kind !== 'SIGNED') expect.unreachable('signer should have signed');
+    if (signed.status !== 'SIGNED') expect.unreachable('signer should have signed');
 
     // The application expects its own signer, so bytes from any other key are refused.
     await expectMismatch(
@@ -211,8 +230,8 @@ describe('signed transaction verification', () => {
 
   it('rejects a transaction hash the signer misreported', async () => {
     const request = makeRequest();
-    const signed = await makeSigner().sign(request, context);
-    if (signed.kind !== 'SIGNED') expect.unreachable('signer should have signed');
+    const signed = await makeSigner().requestSignature(request, context);
+    if (signed.status !== 'SIGNED') expect.unreachable('signer should have signed');
 
     await expectMismatch(
       verifySignedTransaction(
@@ -252,8 +271,8 @@ describe('signed transaction verification', () => {
 
   it('round-trips through parseTransaction with identical fields', async () => {
     const request = makeRequest();
-    const signed = await makeSigner().sign(request, context);
-    if (signed.kind !== 'SIGNED') expect.unreachable('signer should have signed');
+    const signed = await makeSigner().requestSignature(request, context);
+    if (signed.status !== 'SIGNED') expect.unreachable('signer should have signed');
 
     const parsed = parseTransaction(signed.signedTransaction as `0x02${string}`);
     expect(parsed.nonce).toBe(request.nonce);

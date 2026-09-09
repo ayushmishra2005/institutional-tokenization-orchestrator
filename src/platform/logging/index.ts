@@ -9,6 +9,7 @@ export type { Logger };
 const REDACTED_PATHS = [
   'privateKey',
   'private_key',
+  'mnemonic',
   'signedTransaction',
   'signed_transaction',
   'signedRawTransaction',
@@ -26,6 +27,7 @@ export interface LogContext {
   operationId?: string;
   transactionAttemptId?: string;
   transactionHash?: string;
+  providerRequestId?: string;
   actorId?: string;
   [key: string]: unknown;
 }

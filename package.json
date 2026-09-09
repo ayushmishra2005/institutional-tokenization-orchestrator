@@ -32,6 +32,7 @@
     "test:e2e": "vitest run test/integration/e2e-mint.test.ts",
     "test:all": "vitest run",
     "demo": "tsx scripts/demo-mint.ts",
+    "demo:revocation": "tsx scripts/demo-compliance-revocation.ts",
     "demo:clean": "pnpm infra:down && pnpm infra:up && pnpm db:migrate && pnpm demo"
   },
   "dependencies": {

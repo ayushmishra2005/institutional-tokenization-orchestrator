@@ -126,6 +126,22 @@ export class MintHandler implements OperationHandler {
     };
   }
 
+  /**
+   * A signature can arrive long after `prepare` ran. Compliance is therefore checked once
+   * more against the same rules, immediately before the transaction would leave.
+   */
+  async assertStillExecutable(operation: OperationRecord): Promise<void> {
+    const target = await this.resolveTarget(operation);
+    await this.deps.compliance.assertEligibleForExecution({
+      walletId: target.wallet.id,
+      walletAddress: target.wallet.address,
+      chainId: target.asset.chainId,
+      assetId: target.asset.id,
+      amount: target.amount,
+      subjectReference: target.wallet.investorReference,
+    });
+  }
+
   async reconcile(settled: SettledOperation): Promise<ReconciliationReport> {
     const target = await this.resolveTarget(settled.operation);
     return this.deps.reconciliation.reconcileMint({

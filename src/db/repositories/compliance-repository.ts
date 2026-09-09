@@ -17,6 +17,8 @@ export interface ComplianceDecisionRecord {
   readonly chainSyncStatus: string;
   readonly chainSyncTxHash: string | null;
   readonly supersededAt: Date | null;
+  readonly revokedAt: Date | null;
+  readonly revocationReason: string | null;
   readonly createdAt: Date;
 }
 
@@ -31,6 +33,8 @@ export interface InsertComplianceDecisionInput {
   readonly validUntil: Date;
   readonly decidedAt: Date;
   readonly decidedBy: string;
+  readonly revokedAt?: Date;
+  readonly revocationReason?: string;
 }
 
 /**
@@ -110,6 +114,53 @@ export async function findActiveApproval(
     .orderBy(desc(complianceDecisions.decidedAt))
     .limit(1);
   return row ?? null;
+}
+
+/** Live approvals whose validity window has closed, judged by database time. */
+export async function findLatestRevocation(
+  executor: Executor,
+  walletId: string,
+  assetId: string | null,
+): Promise<ComplianceDecisionRecord | null> {
+  const [row] = await executor
+    .select()
+    .from(complianceDecisions)
+    .where(
+      and(
+        eq(complianceDecisions.walletId, walletId),
+        eq(complianceDecisions.status, 'REVOKED'),
+        assetId === null
+          ? isNull(complianceDecisions.assetId)
+          : eq(complianceDecisions.assetId, assetId),
+      ),
+    )
+    .orderBy(desc(complianceDecisions.decidedAt))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function findLapsedApprovals(
+  executor: Executor,
+  limit: number,
+): Promise<ComplianceDecisionRecord[]> {
+  return executor
+    .select()
+    .from(complianceDecisions)
+    .where(
+      and(
+        eq(complianceDecisions.status, 'APPROVED'),
+        isNull(complianceDecisions.supersededAt),
+        sql`${complianceDecisions.validUntil} <= now()`,
+      ),
+    )
+    .limit(limit);
+}
+
+export async function markDecisionExpired(executor: Executor, decisionId: string): Promise<void> {
+  await executor
+    .update(complianceDecisions)
+    .set({ status: 'EXPIRED', supersededAt: sql`now()` })
+    .where(eq(complianceDecisions.id, decisionId));
 }
 
 export async function findDecisionById(
