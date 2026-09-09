@@ -22,6 +22,10 @@ export class Metrics {
   readonly signerPending: Gauge<string>;
   readonly signerFailures: Counter<'reason'>;
   readonly complianceChecks: Counter<'outcome'>;
+  readonly transactionReplacements: Counter<'purpose' | 'result'>;
+  readonly nonceLanesBlocked: Gauge<string>;
+  readonly nonceRecoveries: Counter<'result'>;
+  readonly reorgObservations: Counter<string>;
 
   readonly outboxBacklog: Gauge<'status'>;
   readonly outboxDispatched: Counter<'topic' | 'result'>;
@@ -124,6 +128,32 @@ export class Metrics {
       name: 'ito_compliance_checks_total',
       help: 'Compliance evaluations by outcome',
       labelNames: ['outcome'] as const,
+      registers: [this.registry],
+    });
+
+    this.transactionReplacements = new Counter({
+      name: 'ito_transaction_replacements_total',
+      help: 'Fee replacements created, by attempt purpose and outcome',
+      labelNames: ['purpose', 'result'] as const,
+      registers: [this.registry],
+    });
+
+    this.nonceLanesBlocked = new Gauge({
+      name: 'ito_nonce_lanes_blocked',
+      help: 'Signer lanes holding a reserved nonce that no transaction can consume',
+      registers: [this.registry],
+    });
+
+    this.nonceRecoveries = new Counter({
+      name: 'ito_nonce_recoveries_total',
+      help: 'Nonce-recovery transactions issued to clear a blocked signer lane',
+      labelNames: ['result'] as const,
+      registers: [this.registry],
+    });
+
+    this.reorgObservations = new Counter({
+      name: 'ito_reorg_observations_total',
+      help: 'Times an included block was found to be non-canonical before finality',
       registers: [this.registry],
     });
 

@@ -8,8 +8,8 @@ import { InvalidStateTransitionError } from './errors.js';
  *   SIGNED            bytes exist and are durably persisted; nothing was sent
  *   BROADCASTING      we are about to hand the exact persisted bytes to an RPC node
  *   SUBMITTED         a node acknowledged the transaction hash
- *   INCLUDED          a receipt exists in a block, outcome not yet final
- *   SUCCEEDED         receipt succeeded, expected event validated, confirmations reached
+ *   INCLUDED          a receipt exists in a canonical block, but is not yet final
+ *   SUCCEEDED         receipt succeeded, expected event validated, finality policy met
  *   BROADCAST_UNKNOWN we may or may not have published a valid transaction
  *
  * BROADCAST_UNKNOWN is explicitly NOT a failure. Treating it as one would allow a
@@ -79,7 +79,10 @@ const ALLOWED_TRANSITIONS: Record<OperationState, readonly OperationState[]> = {
   ],
   // SUBMITTED -> BROADCAST_UNKNOWN covers a transaction dropped from the mempool.
   SUBMITTED: [OperationState.INCLUDED, OperationState.BROADCAST_UNKNOWN],
-  INCLUDED: [OperationState.SUCCEEDED, OperationState.REVERTED],
+  // INCLUDED -> SUBMITTED is the reorg edge: the block carrying the receipt left the
+  // canonical chain before finality, so inclusion is no longer an observed fact. The
+  // transaction itself is unchanged and may still be mined.
+  INCLUDED: [OperationState.SUCCEEDED, OperationState.REVERTED, OperationState.SUBMITTED],
   SUCCEEDED: [],
   REVERTED: [],
   FAILED: [],

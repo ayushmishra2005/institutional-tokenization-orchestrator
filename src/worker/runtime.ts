@@ -66,6 +66,10 @@ export function startWorkerRuntime(container: Container): WorkerRuntime {
     void (async () => {
       try {
         const summary = await container.recovery.sweep();
+        const maintenance = await container.replacement.sweep();
+        if (maintenance.replaced + maintenance.recovered > 0) {
+          logger.warn({ maintenance }, 'transaction maintenance took action');
+        }
         const expired = await container.compliance.expireLapsedApprovals();
         if (expired > 0) logger.warn({ expired }, 'retired lapsed compliance approvals');
 

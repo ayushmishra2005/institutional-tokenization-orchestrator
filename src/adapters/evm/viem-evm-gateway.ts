@@ -222,6 +222,31 @@ export class ViemEvmGateway implements EvmGateway {
     return Number(await this.rpc('eth_blockNumber', () => this.client.getBlockNumber()));
   }
 
+  async getBlockHashAt(blockNumber: number): Promise<`0x${string}` | null> {
+    try {
+      const block = await this.instrument('eth_getBlockByNumber', () =>
+        this.client.getBlock({ blockNumber: BigInt(blockNumber), includeTransactions: false }),
+      );
+      return block.hash;
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw new ChainUnavailableError('block lookup failed', error);
+    }
+  }
+
+  async getFinalizedBlockNumber(): Promise<number | null> {
+    try {
+      const block = await this.instrument('eth_getBlockByNumber_finalized', () =>
+        this.client.getBlock({ blockTag: 'finalized', includeTransactions: false }),
+      );
+      return Number(block.number);
+    } catch {
+      // Chains without a finality view answer with an error or a null block; depth
+      // counting is the fallback rather than a reason to stall the operation.
+      return null;
+    }
+  }
+
   decodeMintExecutedEvents(
     contract: `0x${string}`,
     logs: readonly LogView[],

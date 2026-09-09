@@ -307,8 +307,11 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
       correlationId: operation.correlationId,
       createdAt: operation.createdAt.toISOString(),
       stateUpdatedAt: operation.stateUpdatedAt.toISOString(),
-      transactionHash: attempts.find((attempt) => attempt.transactionHash !== null)
-        ?.transactionHash ?? null,
+      // The live attempt, not the first one: a replaced attempt's hash will never be mined.
+      transactionHash:
+        attempts.find(
+          (attempt) => attempt.transactionHash !== null && attempt.replacedByAttemptId === null,
+        )?.transactionHash ?? null,
       history: history.map((entry) => ({ state: entry.state, at: entry.at.toISOString() })),
       // Signed transaction bytes are deliberately never exposed through the API.
       transactionAttempts: attempts.map((attempt) => ({
@@ -318,13 +321,21 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
         nonce: attempt.nonce,
         transactionHash: attempt.transactionHash,
         blockNumber: attempt.blockNumber,
+        blockHash: attempt.blockHash,
         receiptStatus: attempt.receiptStatus,
         broadcastAttempts: attempt.broadcastAttempts,
+        maxFeePerGas: attempt.maxFeePerGas,
+        maxPriorityFeePerGas: attempt.maxPriorityFeePerGas,
+        replacesAttemptId: attempt.replacesAttemptId,
+        replacedByAttemptId: attempt.replacedByAttemptId,
+        replacementReason: attempt.replacementReason,
+        replacementNumber: attempt.replacementNumber,
         errorCode: attempt.errorCode,
       })),
       reconciliation: observations.map((observation) => ({
         kind: observation.kind,
         matched: observation.matched,
+        canonical: observation.canonical,
         severity: observation.severity,
         status: observation.status,
         expected: observation.expected,

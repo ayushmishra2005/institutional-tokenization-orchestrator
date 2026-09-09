@@ -141,6 +141,18 @@ export class LocalSignerProvider implements SignerProvider {
             reason: 'contract creation is only permitted for token deployment',
           };
     }
+    if (context.purpose === 'NONCE_RECOVERY') {
+      // The only transaction this signer will authorise with no calldata: empty data, no
+      // value and its own address as destination, so it cannot carry a business effect.
+      return request.data === '0x' &&
+        request.to.toLowerCase() === this.#account.address.toLowerCase()
+        ? null
+        : {
+            status: 'REJECTED',
+            code: 'NONCE_RECOVERY_SHAPE_NOT_PERMITTED',
+            reason: 'nonce recovery must be an empty self-transfer',
+          };
+    }
     if (!ALLOWED_SELECTORS.has(request.data.slice(0, 10) as `0x${string}`)) {
       return {
         status: 'REJECTED',

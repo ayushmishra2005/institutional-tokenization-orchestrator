@@ -21,7 +21,7 @@ export interface UnsignedTransactionRequest {
 
 /** Non-secret context a policy-enforcing signer can evaluate before agreeing to sign. */
 export interface SigningPolicyContext {
-  readonly purpose: 'DEPLOY_TOKEN' | 'SET_ELIGIBILITY' | 'MINT';
+  readonly purpose: 'DEPLOY_TOKEN' | 'SET_ELIGIBILITY' | 'MINT' | 'NONCE_RECOVERY';
   readonly operationId?: string;
   readonly assetId?: string;
   readonly correlationId: string;

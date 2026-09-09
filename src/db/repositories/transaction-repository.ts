@@ -1,4 +1,4 @@
-import { and, desc, eq, notInArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, ne, notInArray, sql } from 'drizzle-orm';
 import type { Executor, Transaction } from '../pool.js';
 import { chainObservations, signerNonces, transactionAttempts } from '../schema/index.js';
 import { AppError, ErrorCode } from '../../domain/errors.js';
@@ -13,11 +13,13 @@ export const AttemptStatus = {
   CONFIRMED: 'CONFIRMED',
   REVERTED: 'REVERTED',
   FAILED: 'FAILED',
+  /** Superseded by a replacement carrying the same nonce. */
+  REPLACED: 'REPLACED',
 } as const;
 
 export type AttemptStatus = (typeof AttemptStatus)[keyof typeof AttemptStatus];
 
-export type AttemptPurpose = 'DEPLOY_TOKEN' | 'SET_ELIGIBILITY' | 'MINT';
+export type AttemptPurpose = 'DEPLOY_TOKEN' | 'SET_ELIGIBILITY' | 'MINT' | 'NONCE_RECOVERY';
 
 export interface TransactionAttemptRecord {
   readonly id: string;
@@ -46,6 +48,11 @@ export interface TransactionAttemptRecord {
   readonly contractAddress: string | null;
   readonly errorCode: string | null;
   readonly errorMessage: string | null;
+  readonly intentFingerprint: string | null;
+  readonly replacesAttemptId: string | null;
+  readonly replacedByAttemptId: string | null;
+  readonly replacementReason: string | null;
+  readonly replacementNumber: number;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }
@@ -145,6 +152,10 @@ export interface InsertAttemptInput {
   readonly maxFeePerGas: string;
   readonly maxPriorityFeePerGas: string;
   readonly requestHash: string;
+  readonly intentFingerprint: string;
+  readonly replacesAttemptId?: string;
+  readonly replacementReason?: string;
+  readonly replacementNumber?: number;
 }
 
 export async function insertPreparedAttempt(
@@ -290,6 +301,8 @@ export async function listAttemptsForOperation(
 
 export type ObservationKind =
   | 'RECEIPT'
+  | 'BLOCK_CANONICALITY'
+  | 'FINALITY'
   | 'MINT_EVENT'
   | 'REFERENCE_CONSUMED'
   | 'RECIPIENT_BALANCE'
@@ -307,8 +320,11 @@ export interface ObservationInput {
   readonly kind: ObservationKind;
   readonly chainId: number;
   readonly blockNumber: number | null;
+  readonly blockHash: string | null;
   readonly transactionHash: string | null;
   readonly matched: boolean;
+  /** False when the block this observation describes is not on the canonical chain. */
+  readonly canonical?: boolean;
   readonly severity: ObservationSeverity;
   readonly expected: unknown;
   readonly actual: unknown;
@@ -322,6 +338,7 @@ export async function recordObservation(
   await executor.insert(chainObservations).values({
     ...input,
     transactionHash: input.transactionHash === null ? null : input.transactionHash.toLowerCase(),
+    blockHash: input.blockHash === null ? null : input.blockHash.toLowerCase(),
     expected: input.expected ?? null,
     actual: input.actual ?? null,
     // A matched observation is evidence, not a finding, so it is closed on arrival.
@@ -363,4 +380,128 @@ export async function listObservations(
     .from(chainObservations)
     .where(eq(chainObservations.operationId, operationId))
     .orderBy(chainObservations.observedAt);
+}
+
+/**
+ * Marks what was observed about a now-orphaned block as historical rather than deleting
+ * it: the chain did claim this at the time, and that claim is part of the audit trail.
+ */
+export async function invalidateAttemptObservations(
+  executor: Executor,
+  attemptId: string,
+): Promise<number> {
+  const rows = await executor
+    .update(chainObservations)
+    .set({ canonical: false })
+    .where(
+      and(
+        eq(chainObservations.transactionAttemptId, attemptId),
+        eq(chainObservations.canonical, true),
+      ),
+    )
+    .returning({ id: chainObservations.id });
+  return rows.length;
+}
+
+/**
+ * Drops inclusion evidence for an attempt whose block was replaced. The signed bytes,
+ * hash and nonce are untouched: the same transaction may still be mined in a new block.
+ */
+export async function clearAttemptInclusion(executor: Executor, attemptId: string): Promise<void> {
+  await executor
+    .update(transactionAttempts)
+    .set({
+      status: AttemptStatus.SUBMITTED,
+      blockNumber: null,
+      blockHash: null,
+      gasUsed: null,
+      receiptStatus: null,
+      updatedAt: new Date(),
+    })
+    .where(eq(transactionAttempts.id, attemptId));
+}
+
+/** The live attempt holding a nonce, if the lane is occupied. */
+export async function findLiveAttemptAtNonce(
+  executor: Executor,
+  input: { chainId: number; signerAddress: string; nonce: number },
+): Promise<TransactionAttemptRecord | null> {
+  const [row] = await executor
+    .select()
+    .from(transactionAttempts)
+    .where(
+      and(
+        eq(transactionAttempts.chainId, input.chainId),
+        eq(transactionAttempts.fromAddress, input.signerAddress.toLowerCase()),
+        eq(transactionAttempts.nonce, input.nonce),
+        ne(transactionAttempts.status, AttemptStatus.REPLACED),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * Retires an attempt so its nonce can be reused by a replacement. The lane's partial
+ * unique index only ignores REPLACED rows, so this must commit before the new attempt is
+ * inserted; returning false means another dispatcher got there first.
+ */
+export async function retireAttemptForReplacement(
+  executor: Executor,
+  input: { attemptId: string; reason: string },
+): Promise<boolean> {
+  const rows = await executor
+    .update(transactionAttempts)
+    .set({
+      status: AttemptStatus.REPLACED,
+      replacementReason: input.reason,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(transactionAttempts.id, input.attemptId),
+        ne(transactionAttempts.status, AttemptStatus.REPLACED),
+      ),
+    )
+    .returning({ id: transactionAttempts.id });
+  return rows.length > 0;
+}
+
+export async function linkAttemptReplacement(
+  executor: Executor,
+  input: { attemptId: string; replacementId: string },
+): Promise<void> {
+  await executor
+    .update(transactionAttempts)
+    .set({ replacedByAttemptId: input.replacementId })
+    .where(eq(transactionAttempts.id, input.attemptId));
+}
+
+/**
+ * Attempts broadcast but still without a receipt after the chain profile's stuck window.
+ * The window is measured with PostgreSQL time because `updated_at` is written by
+ * PostgreSQL; a worker clock behind the database would replace transactions too eagerly.
+ */
+export async function findStuckAttempts(
+  executor: Executor,
+  input: { chainId: number; stuckAfterMs: number; maxReplacements: number; limit: number },
+): Promise<TransactionAttemptRecord[]> {
+  return executor
+    .select()
+    .from(transactionAttempts)
+    .where(
+      and(
+        eq(transactionAttempts.chainId, input.chainId),
+        inArray(transactionAttempts.status, [
+          AttemptStatus.SUBMITTED,
+          AttemptStatus.BROADCASTING,
+          AttemptStatus.BROADCAST_UNKNOWN,
+        ]),
+        isNull(transactionAttempts.blockNumber),
+        sql`${transactionAttempts.replacementNumber} < ${input.maxReplacements}`,
+        sql`${transactionAttempts.updatedAt} + make_interval(secs => ${input.stuckAfterMs / 1000}) <= now()`,
+      ),
+    )
+    .orderBy(transactionAttempts.updatedAt)
+    .limit(input.limit);
 }

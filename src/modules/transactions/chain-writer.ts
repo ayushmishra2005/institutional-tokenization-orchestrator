@@ -1,5 +1,5 @@
 import type { Database, Transaction } from '../../db/pool.js';
-import type { EvmGateway, EncodedCall } from '../../ports/evm-gateway.js';
+import type { EvmGateway, EncodedCall, FeeEstimate } from '../../ports/evm-gateway.js';
 import type {
   SignerProvider,
   SignerRequestState,
@@ -8,13 +8,21 @@ import type {
 import { verifySignedTransaction } from '../../adapters/evm/signed-transaction-verifier.js';
 import {
   AttemptStatus,
+  findAttemptById,
   insertPreparedAttempt,
+  linkAttemptReplacement,
   persistSignedAttempt,
+  retireAttemptForReplacement,
   reserveNonce,
   updateAttemptStatus,
   type AttemptPurpose,
   type TransactionAttemptRecord,
 } from '../../db/repositories/transaction-repository.js';
+import {
+  assertFeeOnlyReplacement,
+  fingerprintOf,
+  intentFingerprint,
+} from './transaction-intent.js';
 import {
   expireLapsedSignerRequest,
   findSignerRequestForAttempt,
@@ -27,10 +35,14 @@ import { AppError, ErrorCode, isAppError } from '../../domain/errors.js';
 import { canonicalHash } from '../../domain/canonical.js';
 import type { Metrics } from '../../platform/metrics/index.js';
 import type { Logger } from '../../platform/logging/index.js';
+import type { ReplacementPolicy } from '../../platform/config/chain-profile.js';
 
 /** Multiplier applied to the simulated gas estimate to absorb small state drift. */
 const GAS_BUFFER_NUMERATOR = 5n;
 const GAS_BUFFER_DENOMINATOR = 4n;
+
+/** A zero-value self-transfer costs 21000; the rest is headroom for fee-market drift. */
+const NONCE_RECOVERY_GAS_LIMIT = 30_000;
 
 export interface ChainWriteHooks {
   /** Runs in the transaction that reserves the nonce and records the attempt. */
@@ -94,6 +106,7 @@ export interface ChainWriterDeps {
   readonly signer: SignerProvider;
   readonly chainId: number;
   readonly signerRequestTimeoutMs: number;
+  readonly replacement: ReplacementPolicy;
   readonly metrics: Metrics;
   readonly logger: Logger;
 }
@@ -136,6 +149,16 @@ export class ChainWriter {
         chainNonce,
       });
 
+      const fingerprint = intentFingerprint({
+        chainId: this.deps.chainId,
+        from: signerAddress,
+        to: intent.call.to,
+        data: intent.call.data,
+        value: '0',
+        purpose: intent.purpose,
+        operationId: intent.operationId,
+      });
+
       const requestHash = canonicalHash({
         chainId: this.deps.chainId,
         from: signerAddress.toLowerCase(),
@@ -162,6 +185,7 @@ export class ChainWriter {
         maxFeePerGas: fees.maxFeePerGas.toString(),
         maxPriorityFeePerGas: fees.maxPriorityFeePerGas.toString(),
         requestHash,
+        intentFingerprint: fingerprint,
       });
 
       await hooks.onPrepared?.(tx, prepared);
@@ -212,6 +236,224 @@ export class ChainWriter {
     }
 
     return this.settleSignature(attempt, request, state, signerRequest.id, hooks);
+  }
+
+  /**
+   * Replaces a stuck attempt with the same intent at a higher fee.
+   *
+   * Destination, calldata, value and nonce are copied from the stuck row rather than
+   * rebuilt, so there is no code path through which a replacement could carry a different
+   * financial effect than the one that was approved.
+   */
+  async replaceFees(
+    previous: TransactionAttemptRecord,
+    input: { fees: FeeEstimate; reason: string; correlationId: string },
+    hooks: ChainWriteHooks = {},
+  ): Promise<ChainWriteOutcome> {
+    if (previous.replacementNumber >= this.deps.replacement.maxReplacements) {
+      throw new AppError(
+        ErrorCode.REPLACEMENT_LIMIT_REACHED,
+        'replacement limit reached for this transaction',
+        { details: { attemptId: previous.id, replacementNumber: previous.replacementNumber } },
+      );
+    }
+
+    const candidate = {
+      operationId: previous.operationId,
+      assetId: previous.assetId,
+      walletId: previous.walletId,
+      purpose: previous.purpose as AttemptPurpose,
+      chainId: previous.chainId,
+      fromAddress: previous.fromAddress,
+      toAddress: previous.toAddress,
+      nonce: previous.nonce,
+      data: previous.data,
+      value: previous.value,
+    };
+    assertFeeOnlyReplacement(previous, candidate);
+
+    if (
+      BigInt(input.fees.maxFeePerGas) <= BigInt(previous.maxFeePerGas) ||
+      BigInt(input.fees.maxPriorityFeePerGas) <= BigInt(previous.maxPriorityFeePerGas)
+    ) {
+      throw new AppError(
+        ErrorCode.REPLACEMENT_INTENT_MISMATCH,
+        'a replacement must raise both fee fields',
+        { details: { attemptId: previous.id } },
+      );
+    }
+
+    return this.signReplacement(previous, {
+      ...candidate,
+      gasLimit: previous.gasLimit,
+      fees: input.fees,
+      intentFingerprint: fingerprintOf(previous),
+      reason: input.reason,
+      correlationId: input.correlationId,
+      evidence: {
+        replacesAttemptId: previous.id,
+        replacementReason: input.reason,
+        replacementNumber: previous.replacementNumber + 1,
+      },
+      hooks,
+    });
+  }
+
+  /**
+   * Clears a nonce held by an attempt that must never be broadcast, using a zero-value
+   * transaction from the signer to itself at that exact nonce. The nonce is not skipped:
+   * the chain has to see something at that number before later transactions can be mined.
+   */
+  async cancelNonce(
+    blocked: TransactionAttemptRecord,
+    input: { fees: FeeEstimate; reason: string; correlationId: string },
+    hooks: ChainWriteHooks = {},
+  ): Promise<ChainWriteOutcome> {
+    const signerAddress = await this.deps.signer.getSignerAddress();
+    if (signerAddress.toLowerCase() !== blocked.fromAddress.toLowerCase()) {
+      throw new AppError(
+        ErrorCode.REPLACEMENT_INTENT_MISMATCH,
+        'nonce recovery must be signed by the lane owner',
+        { details: { lane: blocked.fromAddress, signer: signerAddress } },
+      );
+    }
+
+    const candidate = {
+      operationId: null,
+      assetId: blocked.assetId,
+      walletId: blocked.walletId,
+      purpose: 'NONCE_RECOVERY' as AttemptPurpose,
+      chainId: blocked.chainId,
+      fromAddress: signerAddress,
+      toAddress: signerAddress,
+      nonce: blocked.nonce,
+      data: '0x',
+      value: '0',
+    };
+
+    return this.signReplacement(blocked, {
+      ...candidate,
+      gasLimit: NONCE_RECOVERY_GAS_LIMIT,
+      fees: input.fees,
+      intentFingerprint: intentFingerprint({
+        chainId: candidate.chainId,
+        from: candidate.fromAddress,
+        to: candidate.toAddress,
+        data: candidate.data,
+        value: candidate.value,
+        purpose: candidate.purpose,
+        operationId: null,
+      }),
+      reason: input.reason,
+      correlationId: input.correlationId,
+      evidence: { recoversAttemptId: blocked.id, blockedNonce: blocked.nonce },
+      hooks,
+    });
+  }
+
+  private async signReplacement(
+    previous: TransactionAttemptRecord,
+    input: {
+      operationId: string | null;
+      assetId: string | null;
+      walletId: string | null;
+      purpose: AttemptPurpose;
+      chainId: number;
+      fromAddress: string;
+      toAddress: string | null;
+      nonce: number;
+      data: string;
+      gasLimit: number;
+      fees: FeeEstimate;
+      intentFingerprint: string;
+      reason: string;
+      correlationId: string;
+      evidence: Readonly<Record<string, unknown>>;
+      hooks: ChainWriteHooks;
+    },
+  ): Promise<ChainWriteOutcome> {
+    const { db, signer } = this.deps;
+
+    const requestHash = canonicalHash({
+      chainId: input.chainId,
+      from: input.fromAddress.toLowerCase(),
+      to: input.toAddress === null ? null : input.toAddress.toLowerCase(),
+      nonce: input.nonce,
+      value: '0',
+      data: input.data.toLowerCase(),
+      gasLimit: input.gasLimit.toString(),
+      maxFeePerGas: input.fees.maxFeePerGas.toString(),
+      maxPriorityFeePerGas: input.fees.maxPriorityFeePerGas.toString(),
+    });
+
+    // Retire, insert, then link: the lane's unique index only ignores REPLACED rows, so
+    // the old attempt has to leave the index before the new one can occupy the nonce.
+    const attempt = await db.transaction(async (tx) => {
+      const retired = await retireAttemptForReplacement(tx, {
+        attemptId: previous.id,
+        reason: input.reason,
+      });
+      if (!retired) {
+        throw new AppError(
+          ErrorCode.OPERATION_CONFLICT,
+          'the attempt was already replaced by another dispatcher',
+          { details: { attemptId: previous.id } },
+        );
+      }
+
+      const inserted = await insertPreparedAttempt(tx, {
+        operationId: input.operationId,
+        assetId: input.assetId,
+        walletId: input.walletId,
+        purpose: input.purpose,
+        chainId: input.chainId,
+        fromAddress: input.fromAddress,
+        toAddress: input.toAddress,
+        nonce: input.nonce,
+        data: input.data,
+        gasLimit: input.gasLimit,
+        maxFeePerGas: input.fees.maxFeePerGas.toString(),
+        maxPriorityFeePerGas: input.fees.maxPriorityFeePerGas.toString(),
+        requestHash,
+        intentFingerprint: input.intentFingerprint,
+        replacesAttemptId: previous.id,
+        replacementReason: input.reason,
+        replacementNumber: previous.replacementNumber + 1,
+      });
+
+      await linkAttemptReplacement(tx, { attemptId: previous.id, replacementId: inserted.id });
+      await input.hooks.onPrepared?.(tx, inserted);
+      return inserted;
+    });
+
+    const request = unsignedRequestFrom(attempt);
+    const state = await signer.requestSignature(request, {
+      purpose: input.purpose,
+      ...(input.operationId === null ? {} : { operationId: input.operationId }),
+      ...(input.assetId === null ? {} : { assetId: input.assetId }),
+      correlationId: input.correlationId,
+      evidence: input.evidence,
+    });
+
+    const signerRequest = await recordSignerRequest(db, {
+      transactionAttemptId: attempt.id,
+      operationId: input.operationId,
+      provider: signer.name,
+      providerRequestId: state.providerRequestId,
+      status: state.status,
+      requestFingerprint: attempt.requestHash,
+    });
+    this.deps.metrics.signerRequests.inc({ provider: signer.name, outcome: state.status });
+
+    if (state.status === 'PENDING') {
+      return {
+        kind: 'SIGNATURE_PENDING',
+        attemptId: attempt.id,
+        providerRequestId: state.providerRequestId,
+      };
+    }
+
+    return this.settleSignature(attempt, request, state, signerRequest.id, input.hooks);
   }
 
   /**
@@ -371,6 +613,22 @@ export class ChainWriter {
     hooks: ChainWriteHooks = {},
   ): Promise<ChainWriteOutcome> {
     const { db, gateway, metrics } = this.deps;
+
+    // A worker that has been holding this attempt while another replaced it must not put
+    // the superseded bytes on the wire: the nonce now belongs to the replacement.
+    const current = await findAttemptById(db, attempt.id);
+    if (current === null || current.status === AttemptStatus.REPLACED) {
+      this.deps.logger.warn(
+        { transactionAttemptId: attempt.id, nonce: attempt.nonce },
+        'refusing to broadcast a superseded attempt',
+      );
+      return {
+        kind: 'FAILED',
+        attemptId: attempt.id,
+        code: 'ATTEMPT_SUPERSEDED',
+        message: 'the attempt was replaced before this broadcast',
+      };
+    }
 
     try {
       await gateway.broadcastRawTransaction(signedTransaction as `0x${string}`);

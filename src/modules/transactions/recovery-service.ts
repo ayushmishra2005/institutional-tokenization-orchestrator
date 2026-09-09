@@ -203,6 +203,9 @@ export class RecoveryService {
     if (attempt === null || attempt.signedRawTransaction === null || attempt.transactionHash === null) {
       return (await this.abandonUnbroadcast(operation)) ? 'FAILED' : 'NOOP';
     }
+    // A superseded attempt's nonce now belongs to its replacement; the replacement sweep
+    // owns getting that intent mined.
+    if (attempt.status === AttemptStatus.REPLACED) return 'NOOP';
 
     const hash = attempt.transactionHash as `0x${string}`;
     const receipt = await this.deps.gateway.getTransactionReceipt(hash);

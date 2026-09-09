@@ -279,6 +279,7 @@ export class ReconciliationService {
         kind: check.kind,
         chainId: this.chainId,
         blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
         transactionHash: receipt.transactionHash,
         matched: check.matched,
         severity: check.matched ? 'INFO' : check.severity,

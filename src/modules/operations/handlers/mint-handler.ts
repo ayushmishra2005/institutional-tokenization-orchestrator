@@ -84,6 +84,7 @@ export class MintHandler implements OperationHandler {
         kind: 'REFERENCE_CONSUMED',
         chainId: this.deps.chainId,
         blockNumber: null,
+        blockHash: null,
         transactionHash: null,
         matched: false,
         severity: 'CRITICAL',

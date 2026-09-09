@@ -26,6 +26,16 @@ const envSchema = z.object({
   /** Confirmations required before an included transaction is treated as final. */
   EVM_CONFIRMATIONS: z.coerce.number().int().min(1).default(2),
   EVM_RECEIPT_TIMEOUT_MS: z.coerce.number().int().min(1000).default(60_000),
+  /** A submitted transaction not included within this window may be fee-replaced. */
+  TRANSACTION_STUCK_AFTER_MS: z.coerce.number().int().min(1000).default(60_000),
+  TRANSACTION_MAX_REPLACEMENTS: z.coerce.number().int().min(0).max(10).default(3),
+  TRANSACTION_FEE_BUMP_PERCENT: z.coerce.number().int().min(10).max(500).default(25),
+
+  /** Optional second chain profile. Absent by default; no test depends on it. */
+  TESTNET_RPC_URL: z.string().url().optional(),
+  TESTNET_CHAIN_ID: z.coerce.number().int().positive().optional(),
+  TESTNET_CONFIRMATIONS: z.coerce.number().int().min(1).default(3),
+
   /** Seconds added to `block.timestamp` when building a mint deadline. */
   SIGNER_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).default(300_000),
   MINT_DEADLINE_SECONDS: z.coerce.number().int().min(30).default(900),

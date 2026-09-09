@@ -13,6 +13,7 @@ import { MockComplianceProvider } from '../adapters/compliance/mock-compliance-p
 import { ChainWriter } from '../modules/transactions/chain-writer.js';
 import { ReconciliationService } from '../modules/transactions/reconciliation-service.js';
 import { RecoveryService } from '../modules/transactions/recovery-service.js';
+import { TransactionReplacementService } from '../modules/transactions/replacement-service.js';
 import { AssetService } from '../modules/assets/asset-service.js';
 import { WalletService } from '../modules/wallets/wallet-service.js';
 import { ComplianceService } from '../modules/compliance/compliance-service.js';
@@ -27,6 +28,7 @@ import { ApprovalService } from '../modules/approvals/approval-service.js';
 import { AuditService } from '../modules/audit/audit-service.js';
 import { OutboxDispatcher } from '../modules/outbox/outbox-dispatcher.js';
 import type { ConfirmationPolicy } from '../modules/transactions/confirmation.js';
+import { resolveChainProfiles, type ChainProfile, type ChainProfiles } from './config/chain-profile.js';
 import type { EvmGateway } from '../ports/evm-gateway.js';
 import type { SignerProvider } from '../ports/signer-provider.js';
 import type { ComplianceProvider } from '../ports/compliance-provider.js';
@@ -44,6 +46,8 @@ export interface Container {
   readonly signer: SignerProvider;
   readonly complianceProvider: ComplianceProvider;
   readonly chainWriter: ChainWriter;
+  readonly chainProfile: ChainProfile;
+  readonly chainProfiles: ChainProfiles;
   readonly confirmation: ConfirmationPolicy;
   readonly assets: AssetService;
   readonly wallets: WalletService;
@@ -54,6 +58,7 @@ export interface Container {
   readonly audit: AuditService;
   readonly dispatcher: OutboxDispatcher;
   readonly recovery: RecoveryService;
+  readonly replacement: TransactionReplacementService;
   close(): Promise<void>;
 }
 
@@ -107,8 +112,12 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
 
   const complianceProvider = options.complianceProvider ?? new MockComplianceProvider();
 
+  const chainProfiles = resolveChainProfiles(config);
+  const chainProfile = chainProfiles.active;
+
   const confirmation: ConfirmationPolicy = {
-    confirmations: config.EVM_CONFIRMATIONS,
+    confirmations: chainProfile.confirmations,
+    finalityTag: chainProfile.finalityTag,
     timeoutMs: config.EVM_RECEIPT_TIMEOUT_MS,
     pollIntervalMs: 200,
   };
@@ -117,8 +126,9 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     db: dbHandle.db,
     gateway,
     signer,
-    chainId: config.EVM_CHAIN_ID,
+    chainId: chainProfile.chainId,
     signerRequestTimeoutMs: config.SIGNER_REQUEST_TIMEOUT_MS,
+    replacement: chainProfile.replacement,
     metrics,
     logger,
   });
@@ -146,6 +156,7 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
   const operationExecutor = new OperationExecutor({
     db: dbHandle.db,
     gateway,
+    chainId: chainProfile.chainId,
     chainWriter,
     confirmation,
     metrics,
@@ -189,6 +200,18 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     options: { staleAfterMs: config.RECOVERY_STALE_AFTER_MS, batchSize: 50 },
   });
 
+  const replacement = new TransactionReplacementService({
+    db: dbHandle.db,
+    gateway,
+    signer,
+    chainWriter,
+    executor: operationExecutor,
+    profile: chainProfile,
+    confirmation,
+    metrics,
+    logger,
+  });
+
   return {
     config,
     logger,
@@ -202,6 +225,8 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     signer,
     complianceProvider,
     chainWriter,
+    chainProfile,
+    chainProfiles,
     confirmation,
     assets,
     wallets,
@@ -212,6 +237,7 @@ export async function createContainer(options: ContainerOptions): Promise<Contai
     audit,
     dispatcher,
     recovery,
+    replacement,
     close: async () => {
       await dispatcher.stop();
       await queue.close();

@@ -45,6 +45,15 @@ export interface FaultGatewayControls {
   expireMintDeadline: boolean;
   /** Number of receipt lookups to fail with a transport error before passing through. */
   failReceiptLookups: number;
+  /**
+   * Heights whose canonical hash is reported as something other than the receipt's block
+   * hash, which is how the orchestrator sees a pre-finality reorg.
+   */
+  orphanedBlocks: Set<number>;
+  /** Withholds receipts entirely, as a node that dropped the transaction would. */
+  hideReceipts: boolean;
+  /** Reported finalized height. Null delegates to the inner chain. */
+  finalizedBlockNumber: number | null;
 }
 
 /**
@@ -59,6 +68,9 @@ export class FaultInjectingGateway implements EvmGateway {
     forceSimulationSuccess: false,
     expireMintDeadline: false,
     failReceiptLookups: 0,
+    orphanedBlocks: new Set<number>(),
+    hideReceipts: false,
+    finalizedBlockNumber: null,
   };
 
   constructor(private readonly inner: EvmGateway) {}
@@ -69,6 +81,9 @@ export class FaultInjectingGateway implements EvmGateway {
     this.controls.forceSimulationSuccess = false;
     this.controls.expireMintDeadline = false;
     this.controls.failReceiptLookups = 0;
+    this.controls.orphanedBlocks.clear();
+    this.controls.hideReceipts = false;
+    this.controls.finalizedBlockNumber = null;
     delete this.controls.beforeBroadcast;
   }
 
@@ -150,11 +165,24 @@ export class FaultInjectingGateway implements EvmGateway {
       this.controls.failReceiptLookups -= 1;
       return Promise.reject(new Error('injected RPC timeout on receipt lookup'));
     }
+    if (this.controls.hideReceipts) return Promise.resolve(null);
     return this.inner.getTransactionReceipt(hash);
   }
 
   getLatestBlockNumber(): Promise<number> {
     return this.inner.getLatestBlockNumber();
+  }
+
+  async getBlockHashAt(blockNumber: number): Promise<`0x${string}` | null> {
+    if (this.controls.orphanedBlocks.has(blockNumber)) {
+      return `0x${blockNumber.toString(16).padStart(64, 'f')}`;
+    }
+    return this.inner.getBlockHashAt(blockNumber);
+  }
+
+  async getFinalizedBlockNumber(): Promise<number | null> {
+    if (this.controls.finalizedBlockNumber !== null) return this.controls.finalizedBlockNumber;
+    return this.inner.getFinalizedBlockNumber();
   }
 
   decodeMintExecutedEvents(

@@ -182,6 +182,7 @@ describe('crash recovery', () => {
         maxFeePerGas: '1000000000',
         maxPriorityFeePerGas: '1000000',
         requestHash: 'a'.repeat(64),
+        intentFingerprint: 'b'.repeat(64),
       });
     });
 

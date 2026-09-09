@@ -111,6 +111,10 @@ export interface EvmGateway {
 
   getTransactionReceipt(hash: `0x${string}`): Promise<TransactionReceiptView | null>;
   getLatestBlockNumber(): Promise<number>;
+  /** Canonical hash at a height, or null if the chain has no such block. */
+  getBlockHashAt(blockNumber: number): Promise<`0x${string}` | null>;
+  /** Null when the chain exposes no finalized tag, as on a local development node. */
+  getFinalizedBlockNumber(): Promise<number | null>;
 
   decodeMintExecutedEvents(
     contract: `0x${string}`,

@@ -1,5 +1,5 @@
 import type { Database, Transaction } from '../../db/pool.js';
-import type { EvmGateway } from '../../ports/evm-gateway.js';
+import type { EvmGateway, TransactionReceiptView } from '../../ports/evm-gateway.js';
 import type { ChainWriter } from '../transactions/chain-writer.js';
 import { awaitConfirmation, type ConfirmationPolicy } from '../transactions/confirmation.js';
 import {
@@ -11,14 +11,21 @@ import {
 } from '../../db/repositories/operation-repository.js';
 import {
   AttemptStatus,
+  clearAttemptInclusion,
   findAttemptById,
   findLatestAttemptForOperation,
+  invalidateAttemptObservations,
+  recordObservation,
   recordReceipt,
   updateAttemptStatus,
   type TransactionAttemptRecord,
 } from '../../db/repositories/transaction-repository.js';
 import { recordAuditEvent } from '../../db/repositories/audit-repository.js';
-import { isTerminalOperationState, OperationState } from '../../domain/operation-state.js';
+import {
+  canTransitionOperation,
+  isTerminalOperationState,
+  OperationState,
+} from '../../domain/operation-state.js';
 import { systemActor } from '../../domain/roles.js';
 import { AppError, ErrorCode, isAppError } from '../../domain/errors.js';
 import type { OperationHandler, SettledOperation } from './operation-handler.js';
@@ -28,6 +35,7 @@ import type { Logger } from '../../platform/logging/index.js';
 export interface OperationExecutorDeps {
   readonly db: Database;
   readonly gateway: EvmGateway;
+  readonly chainId: number;
   readonly chainWriter: ChainWriter;
   readonly confirmation: ConfirmationPolicy;
   readonly handlers: Readonly<Record<string, OperationHandler>>;
@@ -174,6 +182,32 @@ export class OperationExecutor {
   }
 
   /**
+   * State moves for a replacement of an already in-flight attempt.
+   *
+   * The operation stays where it is while the replacement is prepared and signed - it is
+   * not going backwards through SIGNING for a transaction it has already authorised - but
+   * the broadcast outcome and the withheld check still apply.
+   */
+  replacementHooks(operationId: string) {
+    const advance = async (tx: Transaction, to: OperationState) => {
+      const current = await lockOperation(tx, operationId);
+      if (current === null || !canTransitionOperation(current.state as OperationState, to)) return;
+      await transitionOperation(tx, { operation: current, to });
+      this.deps.metrics.operationTransitions.inc({
+        from: current.state,
+        to,
+        type: current.type,
+      });
+    };
+
+    return {
+      assertBroadcastAllowed: this.operationHooks(operationId).assertBroadcastAllowed,
+      onSubmitted: (tx: Transaction) => advance(tx, OperationState.SUBMITTED),
+      onBroadcastUnknown: (tx: Transaction) => advance(tx, OperationState.BROADCAST_UNKNOWN),
+    };
+  }
+
+  /**
    * Moves operation state in lockstep with the transaction attempt, inside the same
    * transactions the ChainWriter uses for its durable steps.
    */
@@ -278,6 +312,10 @@ export class OperationExecutor {
       transactionHash: input.transactionHash,
     });
 
+    if (confirmation.kind === 'ORPHANED') {
+      return this.recordReorg(input.operationId, input.attemptId, receipt, log);
+    }
+
     // Inclusion is recorded before any success/failure judgement is made.
     await db.transaction(async (tx) => {
       const operation = await lockOperation(tx, input.operationId);
@@ -300,6 +338,13 @@ export class OperationExecutor {
         contractAddress: receipt.contractAddress,
       });
     });
+
+    // Canonical inclusion is recorded, but only finality justifies a terminal claim about
+    // money. Until then the sweep keeps re-observing this attempt.
+    if (confirmation.kind === 'INCLUDED') {
+      log.info({ blockNumber: receipt.blockNumber }, 'included; awaiting finality');
+      return { kind: 'PENDING', state: OperationState.INCLUDED };
+    }
 
     const operation = await findOperationById(db, input.operationId);
     if (operation === null) throw new Error('operation disappeared');
@@ -338,6 +383,76 @@ export class OperationExecutor {
       metadata: { ...report.evidence, blockNumber: receipt.blockNumber },
     });
     return { kind: 'SUCCEEDED', transactionHash: input.transactionHash };
+  }
+
+  /**
+   * A block that carried the receipt has left the canonical chain before finality.
+   *
+   * The signed transaction, its hash and its nonce all remain valid, so nothing is
+   * re-signed and no nonce is allocated: only the inclusion evidence is retired, and the
+   * operation goes back to observing.
+   */
+  private async recordReorg(
+    operationId: string,
+    attemptId: string,
+    receipt: TransactionReceiptView,
+    log: Logger,
+  ): Promise<OperationExecutionResult> {
+    const { db, metrics } = this.deps;
+
+    await db.transaction(async (tx) => {
+      const operation = await lockOperation(tx, operationId);
+      if (operation === null) throw new Error('operation disappeared');
+
+      const invalidated = await invalidateAttemptObservations(tx, attemptId);
+      await clearAttemptInclusion(tx, attemptId);
+      await recordObservation(tx, {
+        operationId,
+        transactionAttemptId: attemptId,
+        kind: 'BLOCK_CANONICALITY',
+        chainId: this.deps.chainId,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        transactionHash: receipt.transactionHash,
+        matched: false,
+        canonical: false,
+        severity: 'WARNING',
+        expected: { canonicalBlockHash: receipt.blockHash },
+        actual: { canonical: false },
+        detail: 'including block is no longer canonical; inclusion evidence retired',
+      });
+
+      if (operation.state === OperationState.INCLUDED) {
+        await transitionOperation(tx, { operation, to: OperationState.SUBMITTED });
+        metrics.operationTransitions.inc({
+          from: operation.state,
+          to: OperationState.SUBMITTED,
+          type: operation.type,
+        });
+      }
+
+      await recordAuditEvent(tx, {
+        actor: this.actor,
+        action: 'operation.reorg_observed',
+        resourceType: 'operation',
+        resourceId: operationId,
+        operationId,
+        correlationId: operation.correlationId,
+        metadata: {
+          transactionHash: receipt.transactionHash,
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+          invalidatedObservations: invalidated,
+        },
+      });
+    });
+
+    metrics.reorgObservations.inc();
+    log.warn(
+      { blockNumber: receipt.blockNumber, blockHash: receipt.blockHash },
+      'included block is no longer canonical; continuing to observe',
+    );
+    return { kind: 'PENDING', state: OperationState.SUBMITTED };
   }
 
   private async settle(

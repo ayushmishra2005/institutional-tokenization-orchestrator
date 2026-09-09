@@ -33,6 +33,8 @@
     "test:all": "vitest run",
     "demo": "tsx scripts/demo-mint.ts",
     "demo:revocation": "tsx scripts/demo-compliance-revocation.ts",
+    "demo:replacement": "tsx scripts/demo-replacement.ts",
+    "deploy:token": "tsx scripts/deploy-token.ts",
     "demo:clean": "pnpm infra:down && pnpm infra:up && pnpm db:migrate && pnpm demo"
   },
   "dependencies": {

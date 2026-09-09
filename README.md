@@ -67,10 +67,59 @@ The properties the design exists to guarantee:
   retires lapsed approvals using database time, and revocation queues the on-chain
   eligibility withdrawal asynchronously. A settled mint is never rewritten: the chain
   cannot take it back, so only future eligibility changes.
+- **Inclusion is not finality.** A receipt moves an operation to `INCLUDED`; only the
+  chain profile's finality rule moves it to `SUCCEEDED`. An included block that leaves the
+  canonical chain before then returns the operation to observation instead of failing it.
+- **Fee replacement preserves intent.** A stuck attempt is replaced at the same nonce by
+  the same signer with a higher fee and byte-identical calldata, proven by an intent
+  fingerprint; the earlier attempt stays on record as `REPLACED`.
 - **Reconciliation** of the receipt, the expected event, reference consumption,
   recipient balance and total supply before an operation is called `SUCCEEDED`.
 - **Append-only audit events**, written in the same transaction as the state change
   they describe and protected by a database trigger.
+
+## Chain profiles, finality and replacement
+
+A chain profile (`src/platform/config/chain-profile.ts`) holds the per-chain behaviour the
+rest of the code asks about rather than assumes: chain ID, RPC URL, EIP-1559 support, the
+finality tag the chain exposes, the confirmation depth to fall back on, and the
+replacement policy (how long an attempt may sit without inclusion, the fee bump, the
+maximum number of replacements). Profiles are looked up by chain ID; the active profile
+drives the runtime. Anvil exposes no `finalized` tag, so depth is the only evidence there
+and the profile says so instead of treating a local receipt as mainnet finality.
+
+Confirmation resolves to one of `PENDING`, `INCLUDED`, `FINALIZED`, `REVERTED` or
+`ORPHANED`. Every observation persists the transaction hash, block number, block hash, a
+canonical flag and the attempt it belongs to. When a block that carried an included
+transaction is no longer canonical and the operation has not reached finality, the prior
+observation is marked non-canonical (never deleted), the inclusion evidence on the attempt
+is cleared, and the operation returns to `SUBMITTED` and keeps observing — no new nonce, no
+second mint. Once an operation is finalized, normal reconciliation does not rewind it.
+
+Replacement is worker-driven. An attempt that has been submitted without inclusion for
+longer than the profile's threshold (measured with database time, not worker wall clock)
+becomes eligible: a new attempt is signed with the same nonce, the same destination and the
+same calldata, a bumped fee, and a link back to the attempt it replaces. The intent
+fingerprint is compared before signing, so a replacement that would change the recipient,
+amount, contract, function, operation reference, chain or signer is refused rather than
+silently authorised by the original approval. A superseded attempt is never broadcast
+again.
+
+The same machinery clears a nonce lane blocked by a signed-but-withheld transaction — the
+Phase 4 case where compliance is revoked after signing. Recovery signs a zero-value
+self-transfer at exactly the blocked nonce, marked `NONCE_RECOVERY` and linked to the
+abandoned attempt, so the nonce is consumed on chain with no asset effect and the lane
+becomes usable again. The withheld financial transaction stays as evidence and can no
+longer be broadcast.
+
+`chain_id` is part of transaction identity, nonce lanes are per signer and chain, and
+finality and replacement policy come from the profile, so a second EVM chain is a
+configuration change rather than a redesign. Setting `TESTNET_RPC_URL` and
+`TESTNET_CHAIN_ID` registers a second profile; nothing in the test suite or CI reads them.
+`pnpm deploy:token [chainId]` deploys `InstitutionalToken` against a profile, verifying the
+RPC's chain ID against it first and reading the deploying key from
+`DEPLOY_SIGNER_PRIVATE_KEY` in the environment. No testnet deployment has been performed
+from this repository.
 
 ## Technology
 
@@ -125,6 +174,11 @@ volumes**, brings it back up, migrates and runs the demo.
 the approval, waits for the on-chain eligibility withdrawal, and shows the settled mint
 standing while a further mint is refused.
 
+`pnpm demo:replacement` runs the fee replacement side: a mint whose broadcast response is
+lost sits in `BROADCAST_UNKNOWN`, becomes replacement-eligible, and is replaced at the same
+nonce with a higher fee. It prints both attempts — the original as `REPLACED`, the
+replacement as `CONFIRMED` — and the recipient balance showing a single mint.
+
 `scripts/demo-mint.ts` drives the whole slice in-process — asset creation, wallet
 registration, compliance approval, mint request, both approvals, worker execution,
 confirmation and reconciliation — then prints the operation ID, transaction hash,
@@ -150,7 +204,11 @@ delivery semantics (duplicate delivery, lost queue message), crash recovery
 (undispatched outbox, abandoned nonce reservation, receipt lookup lost mid-confirmation,
 full Redis flush), asynchronous signing (pending signature resumed after a worker
 restart, provider request reuse, rejection, malformed signed bytes, a late signature
-withheld after revocation) and the compliance lifecycle (expiry sweep, re-screening,
+withheld after revocation), fee replacement (same-nonce replacement of a stuck attempt,
+refusal to broadcast a superseded attempt, the replacement ceiling, clearing a nonce lane
+blocked by a withheld transaction), reorg handling (an included block that leaves the
+canonical chain, finalisation once the chain settles, no rewind after finality) and the
+compliance lifecycle (expiry sweep, re-screening,
 revocation, duplicate revocation, revocation racing an in-flight mint).
 
 CI runs the same commands: a quality job (typecheck, lint, unit tests, Foundry tests) and
@@ -214,14 +272,14 @@ traces:
   custody provider against the same local key; it is not an integration with one.
 - Compliance decisions carry a validity window and can be revoked, but the screening
   itself is a mock adapter with no KYC, AML or sanctions data.
-- A withheld broadcast (signer refusal, revocation after signing) consumes its reserved
-  nonce without sending anything, which stalls that signer lane until an operator
-  intervenes. Closing the gap needs fee replacement, which is out of scope.
-- No fee replacement (RBF) or gas escalation: a stuck transaction stays stuck until an
-  operator intervenes.
+- Replacement and nonce recovery are worker policy with no operator override endpoint:
+  the sweep decides, bounded by the profile's replacement ceiling. An attempt that has
+  exhausted its replacements stays stuck and is left for an operator.
 - Reconciliation findings are persisted and exposed through the operations API; there is
   no resolution workflow or UI.
-- Finality on Anvil is approximated by a small confirmation depth; reorgs are not
-  modelled.
-- Single-process deployment model. No deployment tooling, no cloud, no testnet or
-  mainnet configuration.
+- Finality on Anvil is confirmation depth, which is all that node can offer. Reorg
+  handling is covered by a fault-injecting gateway in tests, not by Anvil.
+- A contradiction discovered after finality is not detected: reconciliation does not
+  re-examine finalized operations.
+- Single-process deployment model. A second chain profile and a token deployment script
+  exist, but no cloud or orchestration tooling, and no testnet run has been performed.

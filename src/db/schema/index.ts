@@ -2,6 +2,7 @@
  * Drizzle mirror of src/db/migrations/*.sql, kept in step by hand. The migrations are
  * authoritative: constraints, partial indexes and triggers live there, not here.
  */
+import { sql } from 'drizzle-orm';
 import {
   bigint,
   bigserial,
@@ -299,15 +300,18 @@ export const transactionAttempts = pgTable(
     contractAddress: text('contract_address'),
     errorCode: text('error_code'),
     errorMessage: text('error_message'),
+    intentFingerprint: text('intent_fingerprint'),
+    replacesAttemptId: uuid('replaces_attempt_id'),
+    replacedByAttemptId: uuid('replaced_by_attempt_id'),
+    replacementReason: text('replacement_reason'),
+    replacementNumber: integer('replacement_number').notNull().default(0),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    uniqueIndex('transaction_attempts_nonce_lane_key').on(
-      table.chainId,
-      table.fromAddress,
-      table.nonce,
-    ),
+    uniqueIndex('transaction_attempts_live_nonce_key')
+      .on(table.chainId, table.fromAddress, table.nonce)
+      .where(sql`${table.status} <> 'REPLACED'`),
   ],
 );
 
@@ -319,6 +323,8 @@ export const chainObservations = pgTable('chain_observations', {
   chainId: integer('chain_id').notNull(),
   blockNumber: bigint('block_number', { mode: 'number' }),
   transactionHash: text('transaction_hash'),
+  blockHash: text('block_hash'),
+  canonical: boolean('canonical').notNull().default(true),
   matched: boolean('matched').notNull(),
   severity: text('severity').notNull().default('INFO'),
   status: text('status').notNull().default('OPEN'),
