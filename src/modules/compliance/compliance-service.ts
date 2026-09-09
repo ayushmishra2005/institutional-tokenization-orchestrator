@@ -165,7 +165,7 @@ export class ComplianceService {
     }
 
     return this.deps.db.transaction(async (tx) => {
-      const live = await findActiveApproval(tx, { walletId: wallet.id, assetId, at: new Date() });
+      const live = await findActiveApproval(tx, { walletId: wallet.id, assetId });
       const existingRevocation = await findLatestRevocation(tx, wallet.id, assetId);
       if (live === null && existingRevocation !== null) {
         const inFlight =
@@ -380,7 +380,6 @@ export class ComplianceService {
     const decision = await findActiveApproval(this.deps.db, {
       walletId: input.walletId,
       assetId: input.assetId,
-      at: new Date(),
     });
     if (decision === null) {
       this.deps.metrics.complianceChecks.inc({ outcome: 'no_live_approval' });
@@ -415,6 +414,6 @@ export class ComplianceService {
     walletId: string,
     assetId: string | null,
   ): Promise<ComplianceDecisionRecord | null> {
-    return findActiveApproval(this.deps.db, { walletId, assetId, at: new Date() });
+    return findActiveApproval(this.deps.db, { walletId, assetId });
   }
 }

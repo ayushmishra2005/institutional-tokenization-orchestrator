@@ -49,7 +49,7 @@ export async function supersedeActiveDecisions(
 ): Promise<void> {
   await executor
     .update(complianceDecisions)
-    .set({ supersededAt: new Date() })
+    .set({ supersededAt: sql`now()` })
     .where(
       and(
         eq(complianceDecisions.walletId, walletId),
@@ -91,10 +91,16 @@ export async function markComplianceChainSyncFailed(
     .where(eq(complianceDecisions.id, decisionId));
 }
 
-/** The single live approval covering a wallet, if one exists and has not expired. */
+/**
+ * The single live approval covering a wallet, if one exists and has not expired.
+ *
+ * Validity is a half-open window, `valid_from <= now() < valid_until`, evaluated by
+ * PostgreSQL: the timestamps are database-generated, so an application clock drifting
+ * from the database must not decide whether an approval may authorise execution.
+ */
 export async function findActiveApproval(
   executor: Executor,
-  input: { walletId: string; assetId: string | null; at: Date },
+  input: { walletId: string; assetId: string | null },
 ): Promise<ComplianceDecisionRecord | null> {
   const [row] = await executor
     .select()
@@ -104,8 +110,8 @@ export async function findActiveApproval(
         eq(complianceDecisions.walletId, input.walletId),
         eq(complianceDecisions.status, 'APPROVED'),
         isNull(complianceDecisions.supersededAt),
-        sql`${complianceDecisions.validFrom} <= ${input.at}`,
-        sql`${complianceDecisions.validUntil} > ${input.at}`,
+        sql`${complianceDecisions.validFrom} <= now()`,
+        sql`now() < ${complianceDecisions.validUntil}`,
         input.assetId === null
           ? isNull(complianceDecisions.assetId)
           : sql`(${complianceDecisions.assetId} IS NULL OR ${complianceDecisions.assetId} = ${input.assetId})`,
@@ -116,7 +122,6 @@ export async function findActiveApproval(
   return row ?? null;
 }
 
-/** Live approvals whose validity window has closed, judged by database time. */
 export async function findLatestRevocation(
   executor: Executor,
   walletId: string,
@@ -139,6 +144,7 @@ export async function findLatestRevocation(
   return row ?? null;
 }
 
+/** Live approvals whose validity window has closed, judged by the same database clock. */
 export async function findLapsedApprovals(
   executor: Executor,
   limit: number,

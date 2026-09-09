@@ -87,7 +87,6 @@ export class MintService {
     const decision = await findActiveApproval(this.db, {
       walletId: wallet.id,
       assetId: asset.id,
-      at: new Date(),
     });
     if (decision === null) {
       throw new AppError(

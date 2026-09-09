@@ -64,6 +64,14 @@ describe('compliance decision lifecycle', () => {
     });
   }
 
+  /** Windows are written as SQL expressions so the database sets them on its own clock. */
+  function setWindow(decisionId: string, validFrom: string, validUntil: string) {
+    return harness.container.dbHandle.pool.query(
+      `UPDATE compliance_decisions SET valid_from = ${validFrom}, valid_until = ${validUntil} WHERE id = $1`,
+      [decisionId],
+    );
+  }
+
   it('withdraws on-chain eligibility asynchronously when a decision is revoked', async () => {
     const wallet = await approvedWallet();
     expect(
@@ -129,6 +137,59 @@ describe('compliance decision lifecycle', () => {
     expect(
       await harness.container.gateway.readEligibleUntil(seed.contractAddress, wallet.address),
     ).toBe(0n);
+  }, 120_000);
+
+  it('follows database time when the application clock disagrees about validity', async () => {
+    const wallet = await approvedWallet();
+    const decision = await harness.container.compliance.findActiveDecision(
+      wallet.walletId,
+      seed.assetId,
+    );
+    if (decision === null) expect.unreachable('wallet should have a live approval');
+
+    const eligibility = () =>
+      harness.container.compliance.assertEligibleForExecution({
+        walletId: wallet.walletId,
+        walletAddress: wallet.address,
+        chainId: harness.container.config.EVM_CHAIN_ID,
+        assetId: seed.assetId,
+        amount: '1000000000000000000',
+        subjectReference: decision.subjectReference,
+      });
+
+    await setWindow(decision.id, "now() - interval '1 hour'", "now() + interval '30 seconds'");
+    const stillValid = await findDecisionById(harness.container.db, decision.id);
+    // A worker running an hour ahead of PostgreSQL would read this window as closed.
+    expect(stillValid!.validUntil.getTime()).toBeLessThan(Date.now() + 3_600_000);
+    await expect(eligibility()).resolves.toMatchObject({ decisionId: decision.id });
+
+    await setWindow(decision.id, "now() - interval '1 hour'", "now() - interval '30 seconds'");
+    const lapsed = await findDecisionById(harness.container.db, decision.id);
+    // A worker running an hour behind would read the same window as still open.
+    expect(lapsed!.validUntil.getTime()).toBeGreaterThan(Date.now() - 3_600_000);
+    await expect(eligibility()).rejects.toMatchObject({ code: 'COMPLIANCE_NOT_ELIGIBLE' });
+  }, 120_000);
+
+  it('treats the validity window as half-open, valid_from inclusive and valid_until exclusive', async () => {
+    const wallet = await approvedWallet();
+    const decision = await harness.container.compliance.findActiveDecision(
+      wallet.walletId,
+      seed.assetId,
+    );
+    const active = async () =>
+      (await harness.container.compliance.findActiveDecision(wallet.walletId, seed.assetId)) !==
+      null;
+
+    await setWindow(decision!.id, "now() + interval '1 hour'", "now() + interval '2 hours'");
+    expect(await active()).toBe(false);
+
+    await setWindow(decision!.id, 'now()', "now() + interval '1 hour'");
+    expect(await active()).toBe(true);
+
+    // Each statement opens its own transaction, so this closes the window at an instant
+    // PostgreSQL has already passed.
+    await setWindow(decision!.id, "now() - interval '1 hour'", 'now()');
+    expect(await active()).toBe(false);
   }, 120_000);
 
   it('records a new approval when a wallet is re-screened after expiry', async () => {
