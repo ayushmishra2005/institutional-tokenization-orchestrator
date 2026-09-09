@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { Executor } from '../pool.js';
 import { signerRequests } from '../schema/index.js';
 
@@ -65,19 +65,49 @@ export async function markSignerRequestSigned(executor: Executor, id: string): P
     .where(eq(signerRequests.id, id));
 }
 
-export async function markSignerRequestRefused(
+export async function markSignerRequestRejected(
   executor: Executor,
-  input: { id: string; status: 'REJECTED' | 'EXPIRED'; rejectionCode: string },
+  input: { id: string; rejectionCode: string },
 ): Promise<void> {
   await executor
     .update(signerRequests)
     .set({
-      status: input.status,
+      status: SignerRequestState.REJECTED,
       rejectedAt: sql`now()`,
       lastCheckedAt: sql`now()`,
       rejectionCode: input.rejectionCode,
     })
     .where(eq(signerRequests.id, input.id));
+}
+
+/**
+ * Retires a request the signer never decided. `requested_at` is written by PostgreSQL, so
+ * the deadline is evaluated against PostgreSQL's clock too: an application clock running
+ * behind or ahead of the database must not decide when a signing intent lapses.
+ *
+ * Returns true only for the caller whose UPDATE moved the row out of PENDING.
+ */
+export async function expireLapsedSignerRequest(
+  executor: Executor,
+  input: { id: string; timeoutMs: number },
+): Promise<boolean> {
+  const rows = await executor
+    .update(signerRequests)
+    .set({
+      status: SignerRequestState.EXPIRED,
+      rejectedAt: sql`now()`,
+      lastCheckedAt: sql`now()`,
+      rejectionCode: 'SIGNER_REQUEST_TIMEOUT',
+    })
+    .where(
+      and(
+        eq(signerRequests.id, input.id),
+        eq(signerRequests.status, SignerRequestState.PENDING),
+        sql`${signerRequests.requestedAt} + make_interval(secs => ${input.timeoutMs / 1000}) <= now()`,
+      ),
+    )
+    .returning({ id: signerRequests.id });
+  return rows.length > 0;
 }
 
 export async function touchSignerRequest(executor: Executor, id: string): Promise<void> {

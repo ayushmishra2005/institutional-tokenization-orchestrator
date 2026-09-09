@@ -16,8 +16,9 @@ import {
   type TransactionAttemptRecord,
 } from '../../db/repositories/transaction-repository.js';
 import {
+  expireLapsedSignerRequest,
   findSignerRequestForAttempt,
-  markSignerRequestRefused,
+  markSignerRequestRejected,
   markSignerRequestSigned,
   recordSignerRequest,
   touchSignerRequest,
@@ -233,24 +234,13 @@ export class ChainWriter {
       };
     }
 
-    const state = await signer.fetchSignature(signerRequest.providerRequestId);
-    await touchSignerRequest(db, signerRequest.id);
-
-    if (state.status === 'PENDING') {
-      const waitedMs = Date.now() - signerRequest.requestedAt.getTime();
-      if (waitedMs < this.deps.signerRequestTimeoutMs) {
-        return {
-          kind: 'SIGNATURE_PENDING',
-          attemptId: attempt.id,
-          providerRequestId: signerRequest.providerRequestId,
-        };
-      }
-
-      await markSignerRequestRefused(db, {
-        id: signerRequest.id,
-        status: 'EXPIRED',
-        rejectionCode: 'SIGNER_REQUEST_TIMEOUT',
-      });
+    // Checked before the provider is contacted: a lapsed request must retire even while
+    // the provider is unreachable, and a signature released afterwards must not revive it.
+    const expired = await expireLapsedSignerRequest(db, {
+      id: signerRequest.id,
+      timeoutMs: this.deps.signerRequestTimeoutMs,
+    });
+    if (expired) {
       this.deps.metrics.signerFailures.inc({ reason: 'SIGNER_REQUEST_TIMEOUT' });
       await this.failAttempt(attempt, hooks, {
         code: ErrorCode.SIGNER_REJECTED,
@@ -261,6 +251,17 @@ export class ChainWriter {
         attemptId: attempt.id,
         code: ErrorCode.SIGNER_REJECTED,
         message: 'signer request expired',
+      };
+    }
+
+    const state = await signer.fetchSignature(signerRequest.providerRequestId);
+    await touchSignerRequest(db, signerRequest.id);
+
+    if (state.status === 'PENDING') {
+      return {
+        kind: 'SIGNATURE_PENDING',
+        attemptId: attempt.id,
+        providerRequestId: signerRequest.providerRequestId,
       };
     }
 
@@ -283,11 +284,7 @@ export class ChainWriter {
     const { db, logger } = this.deps;
 
     if (state.status === 'REJECTED') {
-      await markSignerRequestRefused(db, {
-        id: signerRequestId,
-        status: 'REJECTED',
-        rejectionCode: state.code,
-      });
+      await markSignerRequestRejected(db, { id: signerRequestId, rejectionCode: state.code });
       this.deps.metrics.signerFailures.inc({ reason: state.code });
       await this.failAttempt(attempt, hooks, {
         code: ErrorCode.SIGNER_REJECTED,

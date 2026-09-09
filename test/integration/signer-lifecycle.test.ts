@@ -63,6 +63,21 @@ describe('asynchronous signer', () => {
     return { operationId: mint.operationId, attemptId: attempt.id };
   }
 
+  async function signerRequestCount(operationId: string): Promise<number> {
+    const result = await harness.container.dbHandle.pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM signer_requests WHERE operation_id = $1',
+      [operationId],
+    );
+    return Number(result.rows[0]!.count);
+  }
+
+  async function reservedNonce(): Promise<number> {
+    const result = await harness.container.dbHandle.pool.query<{ next_nonce: number }>(
+      'SELECT next_nonce FROM signer_nonces',
+    );
+    return result.rows[0]?.next_nonce ?? 0;
+  }
+
   /** The sweep only touches operations that have stopped moving, judged by database time. */
   async function sweepStale(operationId: string): Promise<void> {
     await harness.container.db
@@ -118,6 +133,12 @@ describe('asynchronous signer', () => {
       'PENDING',
     );
 
+    // A provider that cannot be reached says nothing about the request, so it stays
+    // retryable rather than being retired.
+    const stillPending = await findSignerRequestForAttempt(harness.container.db, attemptId);
+    expect(stillPending?.rejectionCode).toBeNull();
+    expect(stillPending?.rejectedAt).toBeNull();
+
     signer.release(attemptId);
     await sweepStale(operationId);
     expect(await waitForState(harness, operationId, isTerminal, 90_000)).toBe(
@@ -166,6 +187,47 @@ describe('asynchronous signer', () => {
     expect(await getOperationState(harness, operationId)).toBe(OperationState.FAILED);
     expect((await findSignerRequestForAttempt(harness.container.db, attemptId))?.status).toBe(
       'PENDING',
+    );
+  }, 120_000);
+
+  it('retires a request the signer never decided and ignores the signature that follows', async () => {
+    const { operationId, attemptId } = await pendingMint('1000000000000000000');
+    const balanceBefore = await harness.container.gateway.readBalanceOf(
+      seed.contractAddress,
+      seed.recipient,
+    );
+    const nonceBefore = await reservedNonce();
+
+    // The deadline is evaluated against database time, so the request is aged in the
+    // database. The application clock is left alone deliberately.
+    await harness.container.dbHandle.pool.query(
+      `UPDATE signer_requests SET requested_at = now() - interval '1 hour' WHERE transaction_attempt_id = $1`,
+      [attemptId],
+    );
+
+    await sweepStale(operationId);
+    expect(await waitForState(harness, operationId, isTerminal, 60_000)).toBe(OperationState.FAILED);
+    const expired = await findSignerRequestForAttempt(harness.container.db, attemptId);
+    expect(expired?.status).toBe('EXPIRED');
+    expect(expired?.rejectionCode).toBe('SIGNER_REQUEST_TIMEOUT');
+
+    // The signer answers after the deadline. Nothing may act on that answer.
+    signer.release(attemptId);
+    await sweepStale(operationId);
+
+    expect(await getOperationState(harness, operationId)).toBe(OperationState.FAILED);
+    const attempts = await listAttemptsForOperation(harness.container.db, operationId);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]!.signedRawTransaction).toBeNull();
+    expect(attempts[0]!.status).toBe('FAILED');
+
+    const after = await findSignerRequestForAttempt(harness.container.db, attemptId);
+    expect(after?.id).toBe(expired?.id);
+    expect(after?.status).toBe('EXPIRED');
+    expect(await signerRequestCount(operationId)).toBe(1);
+    expect(await reservedNonce()).toBe(nonceBefore);
+    expect(await harness.container.gateway.readBalanceOf(seed.contractAddress, seed.recipient)).toBe(
+      balanceBefore,
     );
   }, 120_000);
 
