@@ -15,3 +15,7 @@ contracts/broadcast/
 *.log
 .DS_Store
 coverage/
+
+# editors
+.idea/
+.vscode/

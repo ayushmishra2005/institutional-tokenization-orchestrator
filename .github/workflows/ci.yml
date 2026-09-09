@@ -5,26 +5,106 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_VERSION: v1.5.1
+
 jobs:
-  typescript:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test:unit
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - run: pnpm contracts:test
+
+  integration:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ito
+          POSTGRES_PASSWORD: ito
+          POSTGRES_DB: ito
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U ito -d ito"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://ito:ito@127.0.0.1:55432/ito
+      REDIS_URL: redis://127.0.0.1:56379
+      EVM_RPC_URL: http://127.0.0.1:58545
+      EVM_CHAIN_ID: 31337
+      JWT_SECRET: ci-local-development-jwt-secret
+      JWT_ISSUER: ito-local
+      JWT_AUDIENCE: ito-api
+      LOCAL_SIGNER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      LOCAL_SIGNER_ADDRESS: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+      LOG_LEVEL: warn
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm lint
-      - run: pnpm test:unit
 
-  contracts:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
-      - run: forge test --root contracts
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      # Same deterministic chain as docker-compose.yml: fixed public mnemonic, fixed
+      # chain id, one-second blocks.
+      - name: Start Anvil
+        run: |
+          anvil --host 127.0.0.1 --port 58545 --chain-id 31337 \
+            --mnemonic "test test test test test test test test test test test junk" \
+            --accounts 10 --balance 10000 --block-time 1 --silent >/tmp/anvil.log 2>&1 &
+          for _ in $(seq 1 60); do
+            cast chain-id --rpc-url "$EVM_RPC_URL" >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "anvil did not become ready" >&2
+          exit 1
+
+      - run: pnpm db:migrate
+      - run: pnpm test:integration
+      - run: pnpm demo

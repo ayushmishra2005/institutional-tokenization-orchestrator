@@ -28,8 +28,10 @@
     "test": "vitest run test/unit",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
+    "test:e2e": "vitest run test/integration/e2e-mint.test.ts",
     "test:all": "vitest run",
-    "demo": "tsx scripts/demo-mint.ts"
+    "demo": "tsx scripts/demo-mint.ts",
+    "demo:clean": "pnpm infra:down && pnpm infra:up && pnpm db:migrate && pnpm demo"
   },
   "dependencies": {
     "bullmq": "^5.34.6",

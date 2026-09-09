@@ -106,6 +106,9 @@ With the infrastructure up and migrations applied:
 pnpm demo
 ```
 
+`pnpm demo:clean` does the same from scratch: it tears the stack down **including its
+volumes**, brings it back up, migrates and runs the demo.
+
 `scripts/demo-mint.ts` drives the whole slice in-process — asset creation, wallet
 registration, compliance approval, mint request, both approvals, worker execution,
 confirmation and reconciliation — then prints the operation ID, transaction hash,
@@ -131,8 +134,10 @@ delivery semantics (duplicate delivery, lost queue message), and crash recovery
 (undispatched outbox, abandoned nonce reservation, receipt lookup lost mid-confirmation,
 full Redis flush).
 
-CI (`.github/workflows/ci.yml`) runs typecheck, lint, unit tests and Foundry tests. The
-integration suites need the full local stack and are run locally, not in CI.
+CI runs the same commands: a quality job (typecheck, lint, unit tests, Foundry tests) and
+an integration job that brings up PostgreSQL and Redis as service containers, starts the
+same deterministic Anvil configuration, migrates, runs the integration suites and finishes
+with the demo. CodeQL (JavaScript/TypeScript) and dependency review run on pull requests.
 
 ## API
 
