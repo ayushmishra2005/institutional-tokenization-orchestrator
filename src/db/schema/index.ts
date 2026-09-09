@@ -235,6 +235,8 @@ export const outbox = pgTable('outbox', {
   dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
   lastError: text('last_error'),
   correlationId: text('correlation_id').notNull(),
+  claimToken: uuid('claim_token'),
+  claimExpiresAt: timestamp('claim_expires_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

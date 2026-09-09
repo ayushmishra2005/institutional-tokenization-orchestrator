@@ -12,7 +12,10 @@ import { startWorkerRuntime, type WorkerRuntime } from '../../src/worker/runtime
 import { OperationState } from '../../src/domain/operation-state.js';
 import { outbox } from '../../src/db/schema/index.js';
 import { listAttemptsForOperation } from '../../src/db/repositories/transaction-repository.js';
-import { markOutboxDispatched } from '../../src/db/repositories/outbox-repository.js';
+import {
+  claimPendingOutbox,
+  markOutboxDispatched,
+} from '../../src/db/repositories/outbox-repository.js';
 import { findOperationById } from '../../src/db/repositories/operation-repository.js';
 
 /**
@@ -106,7 +109,10 @@ describe('worker delivery semantics', () => {
       .from(outbox)
       .where(eq(outbox.aggregateId, mint.operationId));
     expect(row!.status).toBe('PENDING');
-    await markOutboxDispatched(harness.container.db, [row!.id]);
+    const { claimToken } = await harness.container.db.transaction((tx) =>
+      claimPendingOutbox(tx, { limit: 1 }),
+    );
+    await markOutboxDispatched(harness.container.db, { ids: [row!.id], claimToken });
     await harness.container.queue.obliterate({ force: true });
     expect(await harness.container.queue.getJobCounts()).toMatchObject({ waiting: 0, active: 0 });
 

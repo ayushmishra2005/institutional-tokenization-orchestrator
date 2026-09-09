@@ -49,11 +49,21 @@ describe('database-level concurrency guarantees', () => {
         ),
       );
 
-      const claimedIds = batches.flat().map((row) => row.id);
+      const claimedIds = batches.flatMap((batch) => batch.rows.map((row) => row.id));
       expect(new Set(claimedIds).size).toBe(claimedIds.length);
       expect(claimedIds.length).toBe(total);
 
-      await markOutboxDispatched(db, claimedIds);
+      // A dispatcher arriving after those transactions committed must still see nothing:
+      // the claim outlives the row lock.
+      const late = await db.transaction((tx) => claimPendingOutbox(tx, { limit: total }));
+      expect(late.rows).toHaveLength(0);
+
+      for (const batch of batches) {
+        await markOutboxDispatched(db, {
+          ids: batch.rows.map((row) => row.id),
+          claimToken: batch.claimToken,
+        });
+      }
       const remaining = await db
         .select()
         .from(outbox)
@@ -78,7 +88,7 @@ describe('database-level concurrency guarantees', () => {
         .where(eq(outbox.id, row.id));
 
       const claimed = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
-      expect(claimed).toHaveLength(0);
+      expect(claimed.rows).toHaveLength(0);
     });
 
     it('claims rows against the database clock even when the application clock lags', async () => {
@@ -102,10 +112,10 @@ describe('database-level concurrency guarantees', () => {
       const starved = await db.transaction((tx) =>
         claimPendingOutbox(tx, { limit: 10, now: laggingAppClock }),
       );
-      expect(starved).toHaveLength(0);
+      expect(starved.rows).toHaveLength(0);
 
       const claimed = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
-      expect(claimed.map((entry) => entry.id)).toEqual([row.id]);
+      expect(claimed.rows.map((entry) => entry.id)).toEqual([row.id]);
     });
 
     it('schedules retry backoff from database time', async () => {
@@ -119,7 +129,13 @@ describe('database-level concurrency guarantees', () => {
         correlationId: 'backoff',
       });
 
-      await rescheduleOutbox(db, { id: row.id, error: 'redis down', retryAfterMs: 30_000 });
+      const { claimToken } = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 1 }));
+      await rescheduleOutbox(db, {
+        id: row.id,
+        claimToken,
+        error: 'redis down',
+        retryAfterMs: 30_000,
+      });
 
       const [after] = await db
         .select({
@@ -131,7 +147,7 @@ describe('database-level concurrency guarantees', () => {
       expect(Number(after!.secondsFromDbNow)).toBeLessThanOrEqual(30);
     });
 
-    it('increments the attempt counter on each claim', async () => {
+    it('reclaims a row whose lease expired and counts the attempt', async () => {
       const db = harness.container.db;
       await db.delete(outbox);
       const row = await enqueueOutbox(db, {
@@ -142,11 +158,45 @@ describe('database-level concurrency guarantees', () => {
         correlationId: 'retry',
       });
 
-      await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
-      await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
+      const abandoned = await db.transaction((tx) =>
+        claimPendingOutbox(tx, { limit: 10, leaseMs: 0 }),
+      );
+      const reclaimed = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
+      expect(reclaimed.rows.map((entry) => entry.id)).toEqual([row.id]);
+
+      // The first dispatcher lost the row when its lease lapsed and can no longer close it.
+      await markOutboxDispatched(db, { ids: [row.id], claimToken: abandoned.claimToken });
 
       const [after] = await db.select().from(outbox).where(eq(outbox.id, row.id));
+      expect(after!.status).toBe('CLAIMED');
+      expect(after!.claimToken).toBe(reclaimed.claimToken);
       expect(after!.attempts).toBe(2);
+    });
+
+    it('does not hand a live claim to a second dispatcher', async () => {
+      const db = harness.container.db;
+      await db.delete(outbox);
+      const row = await enqueueOutbox(db, {
+        topic: OutboxTopic.OPERATION_READY,
+        aggregateType: 'operation',
+        aggregateId: randomUUID(),
+        payload: { operationId: randomUUID() },
+        correlationId: 'lease',
+      });
+
+      const first = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
+      expect(first.rows.map((entry) => entry.id)).toEqual([row.id]);
+
+      const second = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
+      expect(second.rows).toHaveLength(0);
+
+      await db
+        .update(outbox)
+        .set({ claimExpiresAt: sql`now() - interval '1 second'` })
+        .where(eq(outbox.id, row.id));
+
+      const afterExpiry = await db.transaction((tx) => claimPendingOutbox(tx, { limit: 10 }));
+      expect(afterExpiry.rows.map((entry) => entry.id)).toEqual([row.id]);
     });
   });
 

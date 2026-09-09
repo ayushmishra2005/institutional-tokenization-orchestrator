@@ -21,7 +21,7 @@ export interface OutboxDispatcherOptions {
 /**
  * Publishes committed outbox rows to BullMQ.
  *
- * Rows are claimed with FOR UPDATE SKIP LOCKED so multiple dispatchers can run. Delivery
+ * Rows are leased in PostgreSQL so multiple dispatchers can run concurrently. Delivery
  * is at-least-once by construction: the row is marked dispatched only after the job is
  * accepted, and a crash in between simply republishes it. Duplicate delivery is harmless
  * because the worker claims the operation in PostgreSQL before doing anything.
@@ -65,7 +65,9 @@ export class OutboxDispatcher {
     if (this.running) return 0;
     this.running = true;
     try {
-      const claimed = await this.db.transaction((tx) =>
+      // The lease is committed before any Redis call; holding the row lock across network
+      // I/O would turn queue latency into database contention.
+      const { claimToken, rows: claimed } = await this.db.transaction((tx) =>
         claimPendingOutbox(tx, { limit: this.options.batchSize }),
       );
       if (claimed.length === 0) {
@@ -84,13 +86,14 @@ export class OutboxDispatcher {
           this.logger.error({ err: error, outboxId: row.id }, 'failed to publish outbox row');
           await rescheduleOutbox(this.db, {
             id: row.id,
+            claimToken,
             error: error instanceof Error ? error.message : 'unknown',
             retryAfterMs: this.options.retryAfterMs ?? 2000,
           });
         }
       }
 
-      await markOutboxDispatched(this.db, dispatched);
+      await markOutboxDispatched(this.db, { ids: dispatched, claimToken });
       await this.reportBacklog();
       return dispatched.length;
     } finally {
@@ -122,7 +125,7 @@ export class OutboxDispatcher {
 
   private async reportBacklog(): Promise<void> {
     const counts = await countOutboxByStatus(this.db);
-    for (const status of ['PENDING', 'DISPATCHED', 'FAILED']) {
+    for (const status of ['PENDING', 'CLAIMED', 'DISPATCHED', 'FAILED']) {
       const found = counts.find((entry) => entry.status === status);
       this.metrics.outboxBacklog.set({ status }, found?.count ?? 0);
     }
